@@ -5,7 +5,7 @@ import {
   saveCredentials, getCredentials, startMpLogin, mpLoginStatus,
 } from '../lib/api';
 import type { AccountItem, AccountWhoami } from '../lib/api';
-import { getWhoamiCache, setWhoamiCache, verifyStale } from '../lib/whoami';
+import { getWhoamiCache, setWhoamiCache, verifyStale, whoamiKey } from '../lib/whoami';
 
 type QRState = {
   platform: string;
@@ -39,7 +39,7 @@ function Avatar({ url, name }: { url?: string; name: string }) {
   return <div className="account-avatar account-avatar-fallback">{initial}</div>;
 }
 
-export default function AccountsPage() {
+export default function AccountsPage({ persona = '' }: { persona?: string }) {
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [err, setErr] = useState('');
   const [qr, setQr] = useState<QRState | null>(null);
@@ -50,7 +50,7 @@ export default function AccountsPage() {
   const [smsCode, setSmsCode] = useState('');
   const [smsBusy, setSmsBusy] = useState(false);
   const [smsErr, setSmsErr] = useState('');
-  // whoami 结果缓存到 localStorage：打开页面秒显示昵称/头像，不必每次都起浏览器校验
+  // whoami 结果缓存到 localStorage（键含画像维度）：打开页面秒显示昵称/头像，不必每次都起浏览器校验
   const [whoami, setWhoami] = useState<Record<string, AccountWhoami | 'loading'>>(() => getWhoamiCache());
   // 凭证式登录（微信公众号 AppID/AppSecret）
   const [cred, setCred] = useState<{ platform: string; name: string } | null>(null);
@@ -61,6 +61,11 @@ export default function AccountsPage() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const aliveRef = useRef(true);
   const qrPlatformRef = useRef('');   // 当前登录中的平台，供 submitSms 稳定引用
+  // 多画像多账号：轮询/异步回调里引用「发起登录时」的画像，避免中途切画像串号
+  const personaRef = useRef(persona);
+  personaRef.current = persona;
+  /** 当前画像命名空间下的 whoami 缓存键。 */
+  const wkey = useCallback((platform: string) => whoamiKey(platform, persona), [persona]);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -69,11 +74,13 @@ export default function AccountsPage() {
 
   // 真校验某平台登录态 + 拉昵称/头像（后端起浏览器，数秒）；手动「校验账号」或登录成功后调
   const runWhoami = useCallback((platform: string) => {
-    setWhoami((w) => ({ ...w, [platform]: 'loading' }));
-    accountWhoami(platform)
-      .then((r) => { if (aliveRef.current) { setWhoami((w) => ({ ...w, [platform]: r })); setWhoamiCache(platform, r); } })
+    const p = personaRef.current;
+    const key = whoamiKey(platform, p);
+    setWhoami((w) => ({ ...w, [key]: 'loading' }));
+    accountWhoami(platform, p)
+      .then((r) => { if (aliveRef.current) { setWhoami((w) => ({ ...w, [key]: r })); setWhoamiCache(key, r); } })
       .catch(() => {
-        if (aliveRef.current) setWhoami((w) => { const n = { ...w }; delete n[platform]; return n; });
+        if (aliveRef.current) setWhoami((w) => { const n = { ...w }; delete n[key]; return n; });
       });
   }, []);
 
@@ -81,7 +88,8 @@ export default function AccountsPage() {
   // 浏览器平台逐个真校验（whoami），结果到了刷新 UI，并令陈旧的假阴性缓存被真值覆盖。
   const load = useCallback(() => {
     setErr('');
-    fetchAccounts()
+    const p = personaRef.current;
+    fetchAccounts(p)
       .then((list) => {
         if (!aliveRef.current) return;
         setAccounts(list);
@@ -89,14 +97,29 @@ export default function AccountsPage() {
           .filter((a) => a.supported && a.backend !== 'biliup')
           .map((a) => a.platform);
         verifyStale(targets, {
+          persona: p,
           alive: () => aliveRef.current,
-          onUpdate: (platform, r) => setWhoami((w) => ({ ...w, [platform]: r })),
+          onUpdate: (platform, r) => setWhoami((w) => ({ ...w, [whoamiKey(platform, p)]: r })),
         });
       })
       .catch(() => setErr('加载账号状态失败'));
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  const stopPoll = useCallback(() => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }, []);
+
+  // 切换画像 = 换一套账号命名空间：换掉 whoami 视图缓存并重拉账号态（首挂载不算切换）
+  const firstPersonaRun = useRef(true);
+  useEffect(() => {
+    if (firstPersonaRun.current) { firstPersonaRun.current = false; return; }
+    setWhoami(() => getWhoamiCache());
+    stopPoll();
+    setQr(null);
+    load();
+  }, [persona, stopPoll, load]);
 
   // 切回本标签页 / 窗口重新获得焦点时自动重拉账号态——登录/退出后即使漏了一次刷新，切回来也是最新的，
   // 用户无需手动刷新页面。（登录中弹着二维码时不打扰，避免打断轮询。）
@@ -109,10 +132,6 @@ export default function AccountsPage() {
       document.removeEventListener('visibilitychange', refresh);
     };
   }, [load]);
-
-  const stopPoll = useCallback(() => {
-    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-  }, []);
 
   useEffect(() => () => stopPoll(), [stopPoll]);
 
@@ -128,7 +147,7 @@ export default function AccountsPage() {
     if (code.length < 4) { setSmsErr('请输入手机收到的验证码'); return; }
     setSmsBusy(true); setSmsErr('');
     try {
-      await submitLoginSms(qrPlatformRef.current, code);
+      await submitLoginSms(qrPlatformRef.current, code, personaRef.current);
       setSmsCode('');
       // 乐观切到「验证中」转圈：后端读走码→verifying；成功→success，失败→退回 sms_required 带错误
       setQr((prev) => prev && ({ ...prev, state: 'verifying', message: '正在验证验证码…' }));
@@ -145,7 +164,7 @@ export default function AccountsPage() {
     setCred({ platform: a.platform, name: a.name });
     setCredForm({ appId: '', appSecret: '', author: '' });
     setCredMsg(''); setCredErr('');
-    getCredentials(a.platform)
+    getCredentials(a.platform, personaRef.current)
       .then((c) => { if (aliveRef.current && c.configured) setCredMsg(`已配置：AppID ${c.appIdMasked}`); })
       .catch(() => { /* 未配置，忽略 */ });
   }, []);
@@ -159,7 +178,7 @@ export default function AccountsPage() {
     if (!appId || !appSecret) { setCredErr('AppID 和 AppSecret 都要填'); return; }
     setCredBusy(true); setCredErr(''); setCredMsg('');
     try {
-      const r = await saveCredentials(cred.platform, { appId, appSecret, name: cred.name, author: credForm.author.trim() });
+      const r = await saveCredentials(cred.platform, { appId, appSecret, name: cred.name, author: credForm.author.trim() }, personaRef.current);
       if (r.ok) {
         runWhoami(cred.platform);
         closeCred();
@@ -182,7 +201,7 @@ export default function AccountsPage() {
     qrPlatformRef.current = a.platform;
     setQrNonce((n) => n + 1);
     try {
-      const res = await startLogin(a.platform);
+      const res = await startLogin(a.platform, personaRef.current);
       if (res.mode === 'terminal') {
         setTerminalMsg(res.message || '请在终端登录');
         return;
@@ -193,7 +212,7 @@ export default function AccountsPage() {
       stopPoll();
       pollRef.current = setInterval(async () => {
         try {
-          const s = await loginStatus(a.platform);
+          const s = await loginStatus(a.platform, personaRef.current);
           setQr((prev) => prev && ({ ...prev, state: s.state, message: s.message, qr: s.qr, qrTs: s.qrTs }));
           if (['success', 'expired', 'error'].includes(s.state)) {
             stopPoll();
@@ -214,13 +233,13 @@ export default function AccountsPage() {
     setSmsCode(''); setSmsErr('');
     setQrNonce((n) => n + 1);
     try {
-      const res = await startMpLogin(a.platform);
+      const res = await startMpLogin(a.platform, personaRef.current);
       setQr({ platform: a.platform, name: a.name + ' · 后台取数', state: res.state || 'starting',
               message: res.message || '', qr: res.qr || '', qrTs: res.qrTs });
       stopPoll();
       pollRef.current = setInterval(async () => {
         try {
-          const s = await mpLoginStatus(a.platform);
+          const s = await mpLoginStatus(a.platform, personaRef.current);
           setQr((prev) => prev && ({ ...prev, state: s.state, message: s.message, qr: s.qr, qrTs: s.qrTs }));
           if (['success', 'expired', 'error'].includes(s.state)) {
             stopPoll();
@@ -228,8 +247,8 @@ export default function AccountsPage() {
               // 像快手一样“内存态立即翻”：wechat-oa 的 effLoggedIn 只看 a.loggedIn，这里直接把它乐观置 true，
               // 卡片瞬间变「已登录」，不必等 load() 那趟网络往返（后面 load() 再对账兜底）。
               setAccounts((list) => list.map((x) => x.platform === a.platform ? { ...x, loggedIn: true } : x));
-              setWhoami((w) => { const n = { ...w }; delete n[a.platform]; return n; });
-              setWhoamiCache(a.platform, null);
+              setWhoami((w) => { const n = { ...w }; delete n[whoamiKey(a.platform, personaRef.current)]; return n; });
+              setWhoamiCache(whoamiKey(a.platform, personaRef.current), null);
               runWhoami(a.platform);
               load();
             }
@@ -244,14 +263,17 @@ export default function AccountsPage() {
   }, [stopPoll, runWhoami, load]);
 
   const handleLogout = useCallback(async (a: AccountItem) => {
-    if (!window.confirm(`确定退出「${a.name}」的登录？登录态将被清除，下次发布需重新扫码。`)) return;
+    const p = personaRef.current;
+    if (!window.confirm(p
+      ? `确定退出「${a.name}」在画像「${p}」下的登录？该画像的登录态将被清除，下次发布需重新扫码。`
+      : `确定退出「${a.name}」的登录？登录态将被清除，下次发布需重新扫码。`)) return;
     setLogoutBusy(a.platform);
     try {
-      await logoutAccount(a.platform);
+      await logoutAccount(a.platform, p);
       // 内存态立即翻未登录（同登录路径），不等 load() 回来
       setAccounts((list) => list.map((x) => x.platform === a.platform ? { ...x, loggedIn: false } : x));
-      setWhoami((w) => { const n = { ...w }; delete n[a.platform]; return n; });
-      setWhoamiCache(a.platform, null);
+      setWhoami((w) => { const n = { ...w }; delete n[whoamiKey(a.platform, p)]; return n; });
+      setWhoamiCache(whoamiKey(a.platform, p), null);
       load();
     } catch (e) {
       setErr(e instanceof Error ? e.message : '退出登录失败');
@@ -264,14 +286,14 @@ export default function AccountsPage() {
   // 公众号(wechat-oa)例外：后端查 mp 会话即真值(快且权威)，直接用它，避免浏览器里过期的 whoami 缓存把已登录盖成未登录。
   const effLoggedIn = (a: AccountItem): boolean => {
     if (a.backend === 'wechat-oa') return a.loggedIn;
-    const w = whoami[a.platform];
+    const w = whoami[wkey(a.platform)];
     if (w && w !== 'loading') return w.loggedIn;
     return a.loggedIn;
   };
 
   const badge = (a: AccountItem) => {
     if (!a.supported) return <span className="badge">待重写</span>;
-    if (whoami[a.platform] === 'loading') return <span className="badge">校验中…</span>;
+    if (whoami[wkey(a.platform)] === 'loading') return <span className="badge">校验中…</span>;
     if (effLoggedIn(a)) return <span className="badge badge-ok">✓ 已登录</span>;
     return <span className="badge">未登录</span>;
   };
@@ -289,6 +311,21 @@ export default function AccountsPage() {
         <button className="btn btn-sm" onClick={load}>⟳ 刷新</button>
       </div>
 
+      <div className="card" style={{ padding: '10px 14px', fontSize: 13, marginTop: 12, marginBottom: 4,
+        display: 'flex', alignItems: 'center', gap: 8 }}>
+        {persona ? (
+          <>
+            <span className="badge badge-ok">画像</span>
+            <span>当前操作画像「<b>{persona}</b>」——本页登录/退出的账号只属于它，与其它画像互不影响。</span>
+          </>
+        ) : (
+          <>
+            <span className="badge">通用</span>
+            <span>未选择画像——登录的是<b>通用账号</b>。要用某画像的专属账号，请先在左侧栏选择画像。</span>
+          </>
+        )}
+      </div>
+
       {err && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 12 }}>{err}</div>}
       {terminalMsg && (
         <div className="card" style={{ padding: 13, fontSize: 13, marginTop: 14 }}>{terminalMsg}</div>
@@ -296,7 +333,7 @@ export default function AccountsPage() {
 
       <div className="accounts-grid">
         {accounts.map((a) => {
-          const w = whoami[a.platform];
+          const w = whoami[wkey(a.platform)];
           const info = w && w !== 'loading' ? w : null;
           const logged = effLoggedIn(a);
           return (

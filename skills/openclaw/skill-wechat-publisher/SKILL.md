@@ -137,3 +137,15 @@ python3 skills/openclaw/skill-wechat-publisher/scripts/publish.py --account main
 - Markdown、HTML 与贴图三条入口都会在上传前扫描密钥、内部地址和路径，命中时必须改稿，不得绕过。
 - 两账号 voice/theme 差异是反 AI 检测策略的一部分，不要趋同。
 - 错误码（40164 IP 白名单 / 40001 token / 48001 未授权等）见 [references/errors.md](references/errors.md)。
+
+## 多画像多账号（画像绑定独立账号）
+
+当会话声明了当前画像（如「我当前使用的画像是『X』」）时，每个画像可绑定**一套独立的平台账号**：
+Web「账号」页选中画像 X 后扫码登录，登录态即存入 `~/.easel-browser-profiles/X/`（与通用账号、
+其它画像互不影响）。**凡当前画像非空，登录/发布/取数命令必须追加对应画像参数**；画像为空
+（通用模式）时按默认路径执行、不带这些参数：
+
+- 后台会话模式（默认）：`publish.py` 与 `weixin_mp_stats.py` 全部子命令追加 `--profile-base "$HOME/.easel-browser-profiles/X"`（用该画像扫码的 mp 后台会话发布）。
+- 官方 API 模式：`--account "web@X"`（凭证存 wechat-publisher.yaml 的 `accounts.web@X`，Web 账号页按画像填写）。
+
+当前画像的 mp 后台会话在 `~/.easel-browser-profiles/X/WeixinMpProfile`。

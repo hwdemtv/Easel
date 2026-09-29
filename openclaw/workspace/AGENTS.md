@@ -93,6 +93,7 @@ python skills/openclaw/skill-publish-log/scripts/log.py record --platform <平�
 - 每个画像是 `easel-profiles/<画像>/` 下的一组 `identity/style/audience/platforms/preferences/memory.md`，代表一个跨平台人设。
 - 发现、策划、发布、归因读取六维；制作只凝练制作相关维度。未指定画像时走通用模式，可提示指定画像效果更好。
 - `easel-profiles/<当前画像>/memory.md` 是该会话唯一的账号长期记忆；每轮以消息中声明的当前画像为准，不从其他画像推断或借用经验。
+- **多画像多账号**：每个画像可绑定一套独立的平台账号（Web「账号」页选中画像后扫码登录，登录态存 `~/.easel-browser-profiles/<画像>/`）。当前画像非空时，发布/取数/登录命令必须用该画像的登录态：浏览器平台脚本加 `--profile-base "$HOME/.easel-browser-profiles/<画像>"`；B 站用 `--cookie "$HOME/.easel-browser-profiles/<画像>/cookies-bilibili.json"`；公众号后台会话同 `--profile-base`、官方 API 用 `--account "web@<画像>"`。通用模式（无画像）按默认路径执行。各平台 SKILL 内有具体命令示例。
 - 工作区根目录的全局 `MEMORY.md` 在 Easel 中不承载用户画像、账号经验或创作红线：不要读取、写入或调用 memory 工具检索它。通用模式不使用任何画像的 `memory.md`。
 - 不得为了切换画像而改写、复制或软链接全局 `MEMORY.md`；并行会话必须各自直接读取所绑定画像目录，避免互相覆盖。
 

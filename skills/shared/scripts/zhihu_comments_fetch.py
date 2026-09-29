@@ -11,9 +11,15 @@ import argparse, json, sys, time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-PROFILE_DIR = Path.home() / ".easel-browser-profiles" / "ZhihuProfile"
+PROFILE_NAME = "ZhihuProfile"
 
-def fetch_comments(article_url: str, limit: int = 100):
+
+def _profile_dir(base: str | None = None) -> Path:
+    """登录态目录。多画像多账号：画像 X 传 --profile-base ~/.easel-browser-profiles/X。"""
+    root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
+    return root / PROFILE_NAME
+
+def fetch_comments(article_url: str, limit: int = 100, profile_dir: Path | None = None):
     """通过访问文章页并拦截评论 API 响应来获取评论。"""
     from playwright.sync_api import sync_playwright
 
@@ -40,7 +46,7 @@ def fetch_comments(article_url: str, limit: int = 100):
 
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
-            str(PROFILE_DIR),
+            str(profile_dir or _profile_dir()),
             headless=True,
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         )
@@ -94,9 +100,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("article_url", help="知乎文章完整 URL，如 https://zhuanlan.zhihu.com/p/<id>")
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--profile-base", help="登录态根目录（默认 ~/.easel-browser-profiles）")
     args = parser.parse_args()
 
-    comments = fetch_comments(args.article_url, args.limit)
+    comments = fetch_comments(args.article_url, args.limit, profile_dir=_profile_dir(args.profile_base))
     print(json.dumps(comments, ensure_ascii=False, indent=2))
 
 

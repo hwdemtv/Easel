@@ -75,3 +75,14 @@ python <skill>/scripts/bili_upload.py upload --video out.mp4 --title "标题" \
 
 包装 biliup（biliup/biliup-rs，成熟的 B站命令行投稿工具，Rust 后端），支持完整投稿参数
 （分区 tid、标签、封面、转载、定时）。本 SKILL 加中文分区映射、参数校验与 dry-run 预览。
+
+## 多画像多账号（画像绑定独立账号）
+
+当会话声明了当前画像（如「我当前使用的画像是『X』」）时，每个画像可绑定**一套独立的平台账号**：
+Web「账号」页选中画像 X 后扫码登录，登录态即存入 `~/.easel-browser-profiles/X/`（与通用账号、
+其它画像互不影响）。**凡当前画像非空，登录/发布/取数命令必须追加对应画像参数**；画像为空
+（通用模式）时按默认路径执行、不带这些参数：
+
+- `bili_upload.py`（及 biliup 命令）改用 `--cookie "$HOME/.easel-browser-profiles/X/cookies-bilibili.json"`。
+
+通用模式的 cookie 在仓库根 `cookies.json`；画像绑定的 B 站账号 cookie 在上述画像路径。

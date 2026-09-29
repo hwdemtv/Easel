@@ -27,8 +27,11 @@ class MpLoginTests(unittest.TestCase):
         proc = Mock()
         proc.poll.return_value = None
         status = {'state': 'qr_ready', 'qr': '_login/wechat-oa-mp.png'}
+        # 多画像多账号后：进程表键为 (platform, persona)，_mp_login_status 带画像参数
         env.update(LOGIN_RUNNERS={'wechat-oa': {'backend': 'wechat-oa'}},
-                   LOGIN_PROCESSES={'wechat-oa-mp': proc}, _mp_login_status=lambda: status)
+                   LOGIN_PROCESSES={('wechat-oa-mp', ''): proc},
+                   _mp_login_status=lambda persona=None: status,
+                   _checked_persona=lambda persona=None: persona or '')
         # 文件目录与启动依赖未提供；复用会话不应碰触它们。
         for _ in range(2):
             self.assertEqual(asyncio.run(env['api_mp_login_start']('wechat-oa')), {'mode': 'qr', **status})
@@ -38,7 +41,8 @@ class MpLoginTests(unittest.TestCase):
         proc = Mock()
         proc.poll.return_value = None
         marker = Mock()
-        env.update(LOGIN_PROCESSES={'wechat-oa-mp': proc}, _write_login_marker=marker)
+        env.update(LOGIN_PROCESSES={('wechat-oa-mp', ''): proc},
+                   _write_login_marker=marker)
         env['_stop_mp_login_on_shutdown']()
         proc.terminate.assert_called_once()
         proc.wait.assert_called_once_with(timeout=5)

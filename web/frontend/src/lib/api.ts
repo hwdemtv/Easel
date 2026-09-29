@@ -24,6 +24,11 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** 多画像多账号：带画像参数的请求统一在这里拼 query（空 = 通用模式，不带参数）。 */
+function pq(persona?: string): string {
+  return persona ? `?persona=${encodeURIComponent(persona)}` : '';
+}
+
 export interface StatusResponse {
   gateway: boolean;
   skills: SkillItem[];
@@ -389,17 +394,18 @@ export interface CredentialStatus {
   author: string;
 }
 
-/** 读取凭证式平台（公众号）已配置状态（AppSecret 不回传）。 */
-export function getCredentials(platform: string): Promise<CredentialStatus> {
-  return request<CredentialStatus>(`/api/accounts/${encodeURIComponent(platform)}/credentials`);
+/** 读取凭证式平台（公众号）已配置状态（AppSecret 不回传）。persona 非空 = 该画像绑定的账号。 */
+export function getCredentials(platform: string, persona?: string): Promise<CredentialStatus> {
+  return request<CredentialStatus>(`/api/accounts/${encodeURIComponent(platform)}/credentials${pq(persona)}`);
 }
 
 /** 保存公众号 AppID/AppSecret（后端会调官方接口验证连通性）。 */
 export function saveCredentials(
   platform: string,
   payload: { appId: string; appSecret: string; name?: string; author?: string },
+  persona?: string,
 ): Promise<{ ok: boolean; message: string }> {
-  return request(`/api/accounts/${encodeURIComponent(platform)}/credentials`, {
+  return request(`/api/accounts/${encodeURIComponent(platform)}/credentials${pq(persona)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -407,13 +413,13 @@ export function saveCredentials(
 }
 
 /** 启动「公众号后台」扫码登录（数据中心取数用，独立于 AppID 凭证）。返回二维码状态。 */
-export function startMpLogin(platform: string): Promise<LoginStatus> {
-  return request<LoginStatus>(`/api/accounts/${encodeURIComponent(platform)}/mp-login`, { method: 'POST' });
+export function startMpLogin(platform: string, persona?: string): Promise<LoginStatus> {
+  return request<LoginStatus>(`/api/accounts/${encodeURIComponent(platform)}/mp-login${pq(persona)}`, { method: 'POST' });
 }
 
 /** 轮询公众号后台扫码登录状态。 */
-export function mpLoginStatus(platform: string): Promise<LoginStatus> {
-  return request<LoginStatus>(`/api/accounts/${encodeURIComponent(platform)}/mp-login/status`);
+export function mpLoginStatus(platform: string, persona?: string): Promise<LoginStatus> {
+  return request<LoginStatus>(`/api/accounts/${encodeURIComponent(platform)}/mp-login/status${pq(persona)}`);
 }
 
 export interface LoginStatus {
@@ -424,8 +430,9 @@ export interface LoginStatus {
   qrTs?: number;
 }
 
-export function fetchAccounts(): Promise<AccountItem[]> {
-  return request<AccountItem[]>('/api/accounts');
+/** 平台账号列表。persona 非空 = 该画像命名空间内的登录态。 */
+export function fetchAccounts(persona?: string): Promise<AccountItem[]> {
+  return request<AccountItem[]>(`/api/accounts${pq(persona)}`);
 }
 
 export interface AccountWhoami {
@@ -435,13 +442,13 @@ export interface AccountWhoami {
 }
 
 /** 真校验某平台登录态 + 拉昵称/头像（后端起 headless 浏览器，数秒）。 */
-export function accountWhoami(platform: string): Promise<AccountWhoami> {
-  return request<AccountWhoami>(`/api/accounts/${encodeURIComponent(platform)}/whoami`);
+export function accountWhoami(platform: string, persona?: string): Promise<AccountWhoami> {
+  return request<AccountWhoami>(`/api/accounts/${encodeURIComponent(platform)}/whoami${pq(persona)}`);
 }
 
-/** 退出登录：删该平台持久化登录态。 */
-export function logoutAccount(platform: string): Promise<{ ok: boolean; deleted: string[] }> {
-  return request(`/api/logout/${encodeURIComponent(platform)}`, { method: 'POST' });
+/** 退出登录：删该平台（画像命名空间内）持久化登录态。 */
+export function logoutAccount(platform: string, persona?: string): Promise<{ ok: boolean; deleted: string[] }> {
+  return request(`/api/logout/${encodeURIComponent(platform)}${pq(persona)}`, { method: 'POST' });
 }
 
 export interface PublishResult {
@@ -453,10 +460,11 @@ export interface PublishResult {
 }
 
 /** 一键发布到某平台（真发布，--exec）。media 为 outputs 相对路径数组。
+ * payload.persona 非空 = 用该画像绑定的账号发布。
  * 抖音返回 {async:true}，需轮询 publishStatus；其他平台同步返回结果。 */
 export function publishNow(
   platform: string,
-  payload: { title: string; body: string; media: string[]; tags?: string },
+  payload: { title: string; body: string; media: string[]; tags?: string; persona?: string },
 ): Promise<PublishResult> {
   return request<PublishResult>(`/api/publish/${encodeURIComponent(platform)}`, {
     method: 'POST',
@@ -472,25 +480,25 @@ export interface PublishStatus {
 }
 
 /** 轮询异步发布状态（抖音）。 */
-export function publishStatus(platform: string): Promise<PublishStatus> {
-  return request<PublishStatus>(`/api/publish/${encodeURIComponent(platform)}/status`);
+export function publishStatus(platform: string, persona?: string): Promise<PublishStatus> {
+  return request<PublishStatus>(`/api/publish/${encodeURIComponent(platform)}/status${pq(persona)}`);
 }
 
 /** 发布触发短信墙时回填验证码。 */
-export function submitPublishSms(platform: string, code: string): Promise<{ ok: boolean }> {
-  return request(`/api/publish/${encodeURIComponent(platform)}/sms`, {
+export function submitPublishSms(platform: string, code: string, persona?: string): Promise<{ ok: boolean }> {
+  return request(`/api/publish/${encodeURIComponent(platform)}/sms${pq(persona)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code }),
   });
 }
 
-export function startLogin(platform: string): Promise<LoginStart> {
-  return request<LoginStart>(`/api/login/${encodeURIComponent(platform)}`, { method: 'POST' });
+export function startLogin(platform: string, persona?: string): Promise<LoginStart> {
+  return request<LoginStart>(`/api/login/${encodeURIComponent(platform)}${pq(persona)}`, { method: 'POST' });
 }
 
-export function loginStatus(platform: string): Promise<LoginStatus> {
-  return request<LoginStatus>(`/api/login/${encodeURIComponent(platform)}/status`);
+export function loginStatus(platform: string, persona?: string): Promise<LoginStatus> {
+  return request<LoginStatus>(`/api/login/${encodeURIComponent(platform)}/status${pq(persona)}`);
 }
 
 // ---- 归因层：账号创作数据 ----
@@ -516,19 +524,19 @@ export interface AccountAnalytics {
   fetched_at: number;
 }
 
-/** 支持抓数据的平台 + 各自登录态。 */
-export function fetchAnalyticsPlatforms(): Promise<AnalyticsPlatform[]> {
-  return request<AnalyticsPlatform[]>('/api/analytics/platforms');
+/** 支持抓数据的平台 + 各自登录态（画像命名空间内）。 */
+export function fetchAnalyticsPlatforms(persona?: string): Promise<AnalyticsPlatform[]> {
+  return request<AnalyticsPlatform[]>(`/api/analytics/platforms${pq(persona)}`);
 }
 
 /** 抓某平台已登录账号的创作数据（后端起 headless 浏览器，数秒）。 */
-export function fetchAccountAnalytics(platform: string): Promise<AccountAnalytics> {
-  return request<AccountAnalytics>(`/api/analytics/${encodeURIComponent(platform)}`);
+export function fetchAccountAnalytics(platform: string, persona?: string): Promise<AccountAnalytics> {
+  return request<AccountAnalytics>(`/api/analytics/${encodeURIComponent(platform)}${pq(persona)}`);
 }
 
 /** 回填短信验证码（登录风控短信墙）：提交后 runner 读走填码继续登录。 */
-export function submitLoginSms(platform: string, code: string): Promise<{ ok: boolean }> {
-  return request(`/api/login/${encodeURIComponent(platform)}/sms`, {
+export function submitLoginSms(platform: string, code: string, persona?: string): Promise<{ ok: boolean }> {
+  return request(`/api/login/${encodeURIComponent(platform)}/sms${pq(persona)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code }),

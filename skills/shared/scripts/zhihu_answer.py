@@ -33,7 +33,13 @@ import content_guard  # noqa: E402  出站内容安全闸门
 # ⚠️ 本脚本会被 sync.sh 拍平复制到 workspace/shared/scripts/，那里 parents[3] 会算错根，
 # 相对 content-file 会解析到错误目录——故 env 兜底不可省（与 manifest.py 同款）。
 PROJECT_ROOT = Path(os.environ.get("EASEL_ROOT") or Path(__file__).resolve().parents[3])
-PROFILE_DIR = Path.home() / ".easel-browser-profiles" / "ZhihuProfile"
+PROFILE_NAME = "ZhihuProfile"
+
+
+def _profile_dir(base: str | None = None) -> Path:
+    """登录态目录。多画像多账号：画像 X 传 --profile-base ~/.easel-browser-profiles/X。"""
+    root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
+    return root / PROFILE_NAME
 
 LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -215,14 +221,15 @@ def _click_publish_btn(page) -> bool:
     return False
 
 
-def publish_answer(question_url: str, content: str, headed: bool = False, dry_run: bool = True) -> dict:
+def publish_answer(question_url: str, content: str, headed: bool = False, dry_run: bool = True,
+                   profile_dir: Path | None = None) -> dict:
     from playwright.sync_api import sync_playwright
 
     result = {"success": False, "url": "", "error": ""}
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
-            str(PROFILE_DIR),
+            str(profile_dir or _profile_dir()),
             headless=not headed,
             args=LAUNCH_ARGS,
             viewport={"width": 1280, "height": 900},
@@ -317,6 +324,7 @@ def main():
     parser.add_argument("--allow-unsafe", action="store_true",
                         help="放行内容安全闸门（检出内部设置泄露也照发，谨慎）")
     parser.add_argument("--headed", action="store_true", help="有头浏览器模式（调试用）")
+    parser.add_argument("--profile-base", help="登录态根目录（默认 ~/.easel-browser-profiles）")
     args = parser.parse_args()
 
     content_path = Path(args.content_file)
@@ -343,6 +351,7 @@ def main():
         content=content,
         headed=args.headed,
         dry_run=dry_run,
+        profile_dir=_profile_dir(args.profile_base),
     )
 
     print(json.dumps(result, ensure_ascii=False, indent=2))

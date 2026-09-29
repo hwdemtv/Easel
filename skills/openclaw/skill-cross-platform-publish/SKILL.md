@@ -82,3 +82,14 @@ python skills/openclaw/skill-cross-platform-publish/scripts/publish_dispatch.py 
 
 一稿多发的关键不是"复制粘贴"而是"按平台重适配"。本 SKILL 用约束注册表把各平台的字数/比例/
 标签/类型规则固化，路由到对应 publisher，适配交给 LLM，发布交给平台 SKILL。
+
+## 多画像多账号（画像绑定独立账号）
+
+当会话声明了当前画像（如「我当前使用的画像是『X』」）时，每个画像可绑定**一套独立的平台账号**：
+Web「账号」页选中画像 X 后扫码登录，登录态即存入 `~/.easel-browser-profiles/X/`（与通用账号、
+其它画像互不影响）。**凡当前画像非空，登录/发布/取数命令必须追加对应画像参数**；画像为空
+（通用模式）时按默认路径执行、不带这些参数：
+
+- 分发到各平台 SKILL 执行时，把当前画像的绑定规则一并传递：浏览器平台加 `--profile-base "$HOME/.easel-browser-profiles/X"`，B 站换画像 cookie，公众号按其 SKILL 的画像规则。
+
+画像非空时，`publish_dispatch.py plan` 之后的每个平台执行步骤都必须带画像参数。

@@ -84,3 +84,14 @@ python <ROOT>/skills/shared/scripts/web_publisher.py publish --platform kuaishou
 网页发布思路同 social-auto-upload 的快手模块；本 SKILL 复用统一 Playwright 框架，配置驱动、
 登录态持久化。选择器需按平台现状维护；2026-08-19 真机调试校准（登录态发布子系统探针、JS 派发
 发布按钮、话题上限 4）；2026-09 起成功判定升级为**读回对账**（作品列表比对，界面 URL 信号仅作旁证）。
+
+## 多画像多账号（画像绑定独立账号）
+
+当会话声明了当前画像（如「我当前使用的画像是『X』」）时，每个画像可绑定**一套独立的平台账号**：
+Web「账号」页选中画像 X 后扫码登录，登录态即存入 `~/.easel-browser-profiles/X/`（与通用账号、
+其它画像互不影响）。**凡当前画像非空，登录/发布/取数命令必须追加对应画像参数**；画像为空
+（通用模式）时按默认路径执行、不带这些参数：
+
+- `web_publisher.py` 全部子命令（login/login-qr/publish/whoami）追加 `--profile-base "$HOME/.easel-browser-profiles/X"`。
+
+当前画像的登录态在 `~/.easel-browser-profiles/X/KuaishouProfile`。

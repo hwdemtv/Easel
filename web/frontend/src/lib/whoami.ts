@@ -7,16 +7,21 @@ export const WHOAMI_TTL_MS = 600_000; // 10 分钟，与后端 WHOAMI_TTL 对齐
 
 export type WhoamiEntry = AccountWhoami & { ts: number };
 
+/** 多画像多账号：缓存键按画像隔离（无画像 = 纯平台名，兼容旧缓存）。 */
+export function whoamiKey(platform: string, persona?: string): string {
+  return persona ? `${platform}|${persona}` : platform;
+}
+
 export function getWhoamiCache(): Record<string, WhoamiEntry> {
   try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; }
 }
 
-/** 写缓存；r 为 null 则删除该平台条目。附带 ts 供 TTL 判定（旧格式无 ts→视为过期）。 */
-export function setWhoamiCache(platform: string, r: AccountWhoami | null): void {
+/** 写缓存；r 为 null 则删除该键条目（key 用 whoamiKey 生成）。附带 ts 供 TTL 判定（旧格式无 ts→视为过期）。 */
+export function setWhoamiCache(key: string, r: AccountWhoami | null): void {
   try {
     const c = getWhoamiCache();
-    if (r) c[platform] = { ...r, ts: Date.now() };
-    else delete c[platform];
+    if (r) c[key] = { ...r, ts: Date.now() };
+    else delete c[key];
     localStorage.setItem(KEY, JSON.stringify(c));
   } catch { /* 配额 / 隐私模式：忽略 */ }
 }
@@ -28,6 +33,7 @@ function isFresh(e: WhoamiEntry | undefined, ttlMs: number): boolean {
 interface VerifyOpts {
   ttlMs?: number;
   force?: boolean;
+  persona?: string;   // 多画像多账号：校验该画像命名空间内的登录态
   onUpdate?: (platform: string, r: AccountWhoami) => void;
   alive?: () => boolean;
 }
@@ -42,17 +48,21 @@ const WHOAMI_CONCURRENCY = 2;
 
 export function verifyStale(platforms: string[], opts: VerifyOpts = {}): void {
   const ttlMs = opts.ttlMs ?? WHOAMI_TTL_MS;
+  const persona = opts.persona;
   const cache = getWhoamiCache();
-  const todo = opts.force ? platforms : platforms.filter((p) => !isFresh(cache[p], ttlMs));
+  const todo = opts.force
+    ? platforms.map((p) => [p, whoamiKey(p, persona)] as const)
+    : platforms.filter((p) => !isFresh(cache[whoamiKey(p, persona)], ttlMs))
+        .map((p) => [p, whoamiKey(p, persona)] as const);
   if (!todo.length) return;
   let next = 0;
   const worker = async (): Promise<void> => {
     while (next < todo.length) {
       if (opts.alive && !opts.alive()) return;
-      const p = todo[next++];
+      const [p, key] = todo[next++];
       try {
-        const r = await accountWhoami(p);
-        setWhoamiCache(p, r);
+        const r = await accountWhoami(p, persona);
+        setWhoamiCache(key, r);
         if (!opts.alive || opts.alive()) opts.onUpdate?.(p, r);
       } catch {
         // 校验失败（超时/网络）：保留既有缓存，跳过该平台

@@ -206,11 +206,13 @@ SESSIONS_DIR = OUTPUTS_DIR / "_sessions"   # 每会话最近一轮的完整结�
 # 非 _ 前缀的历史系统目录（归因层数据），内容库不展示（真产物一律在项目目录内）
 SYSTEM_TOPLEVEL_DIRS = {"analytics"}
 LOGIN_TIMEOUT = 240
-LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
+# 键为 (platform, persona)：多画像多账号后，每个画像的登录进程/缓存各自独立（persona 空串 = 通用模式）
+LOGIN_PROCESSES: dict[tuple[str, str], subprocess.Popen] = {}
 
 # whoami 真校验（起 headless 浏览器，数秒）的进程内缓存：避免账号页 + 工作台重复起浏览器。
+# 键为 (platform, persona)，画像间互不串号。
 WHOAMI_TTL = 600  # 秒
-_WHOAMI_CACHE: dict[str, tuple[float, dict]] = {}
+_WHOAMI_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 _WHOAMI_LOCK = threading.Lock()
 
 LOGIN_RUNNERS: dict[str, dict] = {
@@ -233,6 +235,73 @@ WECHAT_PUBLISH_SCRIPT = WECHAT_SKILL_SCRIPTS / "publish.py"
 WECHAT_CONFIG_YAML = WECHAT_SKILL_DIR / "wechat-publisher.yaml"
 WECHAT_WEB_ACCOUNT = "web"   # web 端配置写入/读取的账号 key
 
+# ---- 多画像多账号：按画像隔离的凭证命名空间 ----------------------------------
+# 每个画像 X 独占一套登录态（浏览器 user-data-dir、登录状态文件、B站 cookie、公众号凭证），
+# 与其它画像及「通用模式」（不选画像）物理分目录，互不可见。不带画像参数时所有路径与
+# 历史版本完全一致——已有登录态零迁移、继续可用。
+
+
+def _persona_browser_root(persona: str | None) -> Path:
+    """画像 X 的浏览器登录态根目录；通用模式（persona 为空）返回全局根。"""
+    if persona:
+        return BROWSER_PROFILES / persona
+    return BROWSER_PROFILES
+
+
+def _persona_login_dir(persona: str | None) -> Path:
+    """画像 X 的登录状态文件目录：outputs/_login[/<画像>]。"""
+    return LOGIN_DIR / persona if persona else LOGIN_DIR
+
+
+def _persona_publish_dir(persona: str | None) -> Path:
+    """画像 X 的异步发布状态目录：outputs/_publish[/<画像>]。"""
+    return PUBLISH_DIR / persona if persona else PUBLISH_DIR
+
+
+def _bili_cookie_path(persona: str | None) -> Path:
+    """B 站 biliup cookie：通用模式在仓库根（历史位置），画像模式放画像根下。"""
+    if persona:
+        return BROWSER_PROFILES / persona / 'cookies-bilibili.json'
+    return PROJECT_ROOT / 'cookies.json'
+
+
+def _wechat_account_key(persona: str | None) -> str:
+    """公众号 yaml 账号 key：通用 "web"，画像 "web@<画像>"（@ 在文件名中合法，
+    token 缓存文件 .token_cache_<key>.json 因此无需转义）。"""
+    if persona:
+        return f"{WECHAT_WEB_ACCOUNT}@{persona}"
+    return WECHAT_WEB_ACCOUNT
+
+
+def _checked_persona(persona: str | None) -> str:
+    """校验请求携带的画像参数：空 = 通用模式；非法名 400；画像不存在 404。"""
+    p = (persona or '').strip()
+    if not p:
+        return ''
+    if not _valid_persona_name(p):
+        raise HTTPException(400, '画像名非法')
+    if not profile_exists(p):
+        raise HTTPException(404, f'画像「{p}」不存在')
+    return p
+
+
+def _purge_persona_credentials(name: str) -> list[str]:
+    """删除画像时顺带清掉它的凭证命名空间（浏览器目录/登录状态/发布状态/公众号账号）。"""
+    deleted: list[str] = []
+    root = _persona_browser_root(name)
+    if root.is_dir() and BROWSER_PROFILES.resolve() in root.resolve().parents:
+        shutil.rmtree(root, ignore_errors=True)
+        deleted.append(f'~/.easel-browser-profiles/{name}')
+    for d in (_persona_login_dir(name), _persona_publish_dir(name)):
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            deleted.append(str(d.relative_to(PROJECT_ROOT)))
+    try:
+        _wechat_clear_credentials(name)
+    except Exception:
+        pass   # yaml 缺失/文件损坏不应阻断画像删除
+    return deleted
+
 
 def _wechat_load_yaml() -> dict:
     """读 wechat-publisher.yaml（不存在或损坏则返回空 dict）。"""
@@ -246,26 +315,28 @@ def _wechat_load_yaml() -> dict:
         return {}
 
 
-def _wechat_web_account() -> dict:
-    """返回 web 端配置的公众号账号（accounts.web），无则空 dict。"""
+def _wechat_web_account(persona: str | None = None) -> dict:
+    """返回 web 端配置的公众号账号（通用 accounts.web / 画像 accounts.web@<画像>），无则空 dict。"""
     cfg = _wechat_load_yaml()
     accts = cfg.get("accounts") if isinstance(cfg.get("accounts"), dict) else {}
-    acc = accts.get(WECHAT_WEB_ACCOUNT)
+    acc = accts.get(_wechat_account_key(persona))
     return acc if isinstance(acc, dict) else {}
 
 
-def _wechat_has_credentials() -> bool:
-    acc = _wechat_web_account()
+def _wechat_has_credentials(persona: str | None = None) -> bool:
+    acc = _wechat_web_account(persona)
     return bool(acc.get("app_id") and acc.get("app_secret"))
 
 
-def _wechat_save_credentials(app_id: str, app_secret: str, name: str = "", author: str = "") -> None:
-    """把 AppID/AppSecret 写入 wechat-publisher.yaml 的 accounts.web（原子写，保留其它账号）。"""
+def _wechat_save_credentials(app_id: str, app_secret: str, name: str = "", author: str = "",
+                             persona: str | None = None) -> None:
+    """把 AppID/AppSecret 写入 wechat-publisher.yaml 的对应账号 key（原子写，保留其它账号）。"""
     import yaml
+    key = _wechat_account_key(persona)
     cfg = _wechat_load_yaml()
     if not isinstance(cfg.get("accounts"), dict):
         cfg["accounts"] = {}
-    acc = cfg["accounts"].get(WECHAT_WEB_ACCOUNT)
+    acc = cfg["accounts"].get(key)
     if not isinstance(acc, dict):
         acc = {}
     acc["name"] = name or acc.get("name") or "微信公众号"
@@ -274,23 +345,24 @@ def _wechat_save_credentials(app_id: str, app_secret: str, name: str = "", autho
     if author:
         acc["author"] = author
     acc.setdefault("author", "")
-    cfg["accounts"][WECHAT_WEB_ACCOUNT] = acc
+    cfg["accounts"][key] = acc
     # web 账号存在即设为默认，方便 CLI 直接用
-    cfg.setdefault("default", WECHAT_WEB_ACCOUNT)
+    cfg.setdefault("default", key)
     WECHAT_CONFIG_YAML.parent.mkdir(parents=True, exist_ok=True)
     tmp = WECHAT_CONFIG_YAML.with_suffix(".yaml.tmp")
     tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     os.replace(tmp, WECHAT_CONFIG_YAML)
 
 
-def _wechat_clear_credentials() -> None:
-    """删除 accounts.web 及其 token 缓存。"""
+def _wechat_clear_credentials(persona: str | None = None) -> None:
+    """删除对应画像的公众号账号 key 及其 token 缓存。"""
     import yaml
+    key = _wechat_account_key(persona)
     cfg = _wechat_load_yaml()
     accts = cfg.get("accounts")
-    if isinstance(accts, dict) and WECHAT_WEB_ACCOUNT in accts:
-        accts.pop(WECHAT_WEB_ACCOUNT, None)
-        if cfg.get("default") == WECHAT_WEB_ACCOUNT:
+    if isinstance(accts, dict) and key in accts:
+        accts.pop(key, None)
+        if cfg.get("default") == key:
             cfg["default"] = next(iter(accts), "") if accts else ""
         try:
             tmp = WECHAT_CONFIG_YAML.with_suffix(".yaml.tmp")
@@ -298,7 +370,7 @@ def _wechat_clear_credentials() -> None:
             os.replace(tmp, WECHAT_CONFIG_YAML)
         except Exception:
             pass
-    for cache in (WECHAT_SKILL_SCRIPTS / f".token_cache_{WECHAT_WEB_ACCOUNT}.json",
+    for cache in (WECHAT_SKILL_SCRIPTS / f".token_cache_{key}.json",
                   WECHAT_SKILL_SCRIPTS / ".token_cache.json"):
         try:
             cache.unlink()
@@ -306,8 +378,8 @@ def _wechat_clear_credentials() -> None:
             pass
 
 
-def _wechat_verify_token() -> tuple[bool, str]:
-    """用当前 accounts.web 凭证调官方 token 接口验证。返回 (ok, message)。
+def _wechat_verify_token(persona: str | None = None) -> tuple[bool, str]:
+    """用对应画像的公众号凭证调官方 token 接口验证。返回 (ok, message)。
     在子进程里跑，避免把 skill 的 import 副作用带进 web 进程。"""
     code = (
         "import sys; sys.path.insert(0, %r)\n"
@@ -319,7 +391,7 @@ def _wechat_verify_token() -> tuple[bool, str]:
         "    print('OK' if t else 'EMPTY')\n"
         "except Exception as e:\n"
         "    print('ERR:' + str(e))\n"
-    ) % (str(WECHAT_SKILL_SCRIPTS), WECHAT_WEB_ACCOUNT)
+    ) % (str(WECHAT_SKILL_SCRIPTS), _wechat_account_key(persona))
     try:
         proc = subprocess.run([sys.executable, "-c", code], cwd=str(WECHAT_SKILL_SCRIPTS),
                               env=_wechat_env(), capture_output=True, text=True, timeout=30)
@@ -1097,7 +1169,7 @@ async def api_persona_file_save(name: str, req: PersonaFileRequest):
 
 @app.delete("/api/persona/{name}")
 async def api_persona_delete(name: str):
-    """删除整个画像目录。"""
+    """删除整个画像目录，并顺带清掉它绑定的账号登录态（多画像多账号命名空间）。"""
     if not _valid_persona_name(name):
         raise HTTPException(400, "画像名非法")
     pd = (PROFILES_DIR / name).resolve()
@@ -1105,7 +1177,8 @@ async def api_persona_delete(name: str):
         raise HTTPException(404, "画像不存在")
     import shutil
     shutil.rmtree(pd)
-    return {"ok": True, "deleted": name}
+    deleted = [name, *_purge_persona_credentials(name)]
+    return {"ok": True, "deleted": "、".join(deleted)}
 
 
 @app.get("/api/skills")
@@ -2981,12 +3054,13 @@ async def api_upload_local(
     return {"ok": True, "files": saved}
 
 
-def _write_login_marker(platform: str, state: str, message: str = '') -> None:
-    """回写登录标记 outputs/_login/<平台>.json（与 login_state.write_status 同格式，原子写）。
+def _write_login_marker(platform: str, state: str, message: str = '', persona: str | None = None) -> None:
+    """回写登录标记 outputs/_login[/<画像>]/<平台>.json（与 login_state.write_status 同格式，原子写）。
     whoami 真校验确认已登录后调用 → _account_logged_in 的快速路径此后自愈并持久。"""
-    LOGIN_DIR.mkdir(parents=True, exist_ok=True)
+    d = _persona_login_dir(persona)
+    d.mkdir(parents=True, exist_ok=True)
     data = {"state": state, "message": message, "qr": "", "ts": int(time.time())}
-    st = LOGIN_DIR / f'{platform}.json'
+    st = d / f'{platform}.json'
     tmp = st.with_suffix('.json.tmp')
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
@@ -2998,8 +3072,8 @@ def _write_login_marker(platform: str, state: str, message: str = '') -> None:
             pass
 
 
-def _account_logged_in(platform: str, cfg: dict) -> bool:
-    """尽力判断某平台是否已登录。
+def _account_logged_in(platform: str, cfg: dict, persona: str | None = None) -> bool:
+    """尽力判断某平台（画像命名空间内）是否已登录。
     浏览器平台的登录态只有启动浏览器才真能知道（profile 里总有 Cookies 文件，存在≠已登录，
     会误报），故这里只信「本流程最近一次登录成功」——即 status.json == success。
     biliup 的 cookies.json 只有登录成功才生成，可直接判。"""
@@ -3007,16 +3081,16 @@ def _account_logged_in(platform: str, cfg: dict) -> bool:
     if backend == 'unsupported':
         return False
     if backend == 'biliup':
-        return (PROJECT_ROOT / 'cookies.json').is_file()
+        return _bili_cookie_path(persona).is_file()
     if backend == 'wechat-oa':
         # 发布+数据都走「后台会话」→ 以 mp 后台登录成功为准；AppID 凭证作为兜底（旧配置）
         try:
-            if _mp_login_status().get('state') == 'success':
+            if _mp_login_status(persona).get('state') == 'success':
                 return True
         except Exception:
             pass
-        return _wechat_has_credentials()
-    st = LOGIN_DIR / f'{platform}.json'
+        return _wechat_has_credentials(persona)
+    st = _persona_login_dir(persona) / f'{platform}.json'
     if st.is_file():
         try:
             return json.loads(st.read_text(encoding="utf-8")).get('state') == 'success'
@@ -3025,26 +3099,28 @@ def _account_logged_in(platform: str, cfg: dict) -> bool:
     return False
 
 
-def _login_status(platform: str) -> dict:
-    """读登录状态文件 + 二维码是否就绪。"""
-    st = LOGIN_DIR / f'{platform}.json'
+def _login_status(platform: str, persona: str | None = None) -> dict:
+    """读登录状态文件 + 二维码是否就绪（画像命名空间内）。"""
+    d = _persona_login_dir(persona)
+    st = d / f'{platform}.json'
     data = {'state': 'unknown', 'message': ''}
     if st.is_file():
         try:
-            d = json.loads(st.read_text(encoding="utf-8"))
-            data = {'state': d.get('state', 'unknown'), 'message': d.get('message', '')}
+            d_json = json.loads(st.read_text(encoding="utf-8"))
+            data = {'state': d_json.get('state', 'unknown'), 'message': d_json.get('message', '')}
         except Exception:
             pass
     # A runner that exits before writing its status must become an actionable error,
     # never the ambiguous ``unknown`` state shown as an endless spinner in the UI.
-    proc = LOGIN_PROCESSES.get(platform)
+    proc = LOGIN_PROCESSES.get((platform, persona or ''))
     if data['state'] in ('unknown', 'starting') and proc is not None:
         code = proc.poll()
         if code is not None:
-            data = {'state': 'error', 'message': f'登录程序异常退出（退出码 {code}），请查看 outputs/_login/{platform}.log'}
-    qr = LOGIN_DIR / f'{platform}.png'
+            rel = st.relative_to(OUTPUTS_DIR).as_posix().replace('.json', '.log')
+            data = {'state': 'error', 'message': f'登录程序异常退出（退出码 {code}），请查看 outputs/{rel}'}
+    qr = d / f'{platform}.png'
     if qr.is_file():
-        data['qr'] = f'_login/{platform}.png'
+        data['qr'] = qr.relative_to(OUTPUTS_DIR).as_posix()
         try:
             data['qrTs'] = int(qr.stat().st_mtime)   # 二维码 mtime 作缓存键：码每刷新一次就变，前端 img 随之刷新
         except OSError:
@@ -3056,87 +3132,92 @@ def _login_status(platform: str) -> dict:
 
 
 @app.get("/api/accounts")
-async def api_accounts():
+async def api_accounts(persona: str | None = None):
+    p = _checked_persona(persona)
     return [
         {'platform': pf, 'name': cfg['name'], 'backend': cfg['backend'],
          'supported': cfg['backend'] != 'unsupported',
-         'loggedIn': _account_logged_in(pf, cfg),
+         'loggedIn': _account_logged_in(pf, cfg, p),
          'note': cfg.get('note', '')}
         for pf, cfg in LOGIN_RUNNERS.items()
     ]
 
 
 @app.post("/api/login/{platform}")
-async def api_login_start(platform: str):
-    """启动某平台登录：浏览器平台后台跑 QR runner，轮询到二维码就绪即返回。"""
+async def api_login_start(platform: str, persona: str | None = None):
+    """启动某平台登录（画像命名空间内）：浏览器平台后台跑 QR runner，轮询到二维码就绪即返回。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg:
         raise HTTPException(404, '未知平台')
+    p = _checked_persona(persona)
     backend = cfg['backend']
     if backend == 'unsupported':
         raise HTTPException(400, f"{cfg['name']} 暂不可用：{cfg.get('note', '')}")
     if backend == 'wechat-oa':
         # 公众号不走扫码：前端应改用凭证表单提交到 /api/accounts/{platform}/credentials。
-        return {'mode': 'credentials', 'configured': _wechat_has_credentials(),
+        return {'mode': 'credentials', 'configured': _wechat_has_credentials(p),
                 'message': '微信公众号请填写 AppID / AppSecret'}
-    LOGIN_DIR.mkdir(parents=True, exist_ok=True)
-    qr = LOGIN_DIR / f'{platform}.png'
-    status = LOGIN_DIR / f'{platform}.json'
+    d = _persona_login_dir(p)
+    d.mkdir(parents=True, exist_ok=True)
+    qr = d / f'{platform}.png'
+    status = d / f'{platform}.json'
     for f in (qr, status):
         try:
             f.unlink()
         except OSError:
             pass
+    base_args = ['--profile-base', str(_persona_browser_root(p))]
     if backend == 'xhs':
-        cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'login', '--no-proxy',
+        cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'login', '--no-proxy', *base_args,
                '--qr-out', str(qr), '--status-file', str(status), '--timeout', str(LOGIN_TIMEOUT)]
     elif backend == 'biliup':
         # B站：TV 端扫码登录 API 生成二维码 + 写 biliup cookie（biliup login 需真终端，前端用不了）
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'bili_login.py'), 'login',
                '--qr-out', str(qr), '--status-file', str(status),
-               '--cookie', str(PROJECT_ROOT / 'cookies.json'), '--timeout', str(LOGIN_TIMEOUT)]
+               '--cookie', str(_bili_cookie_path(p)), '--timeout', str(LOGIN_TIMEOUT)]
     elif backend == 'douyin':
-        code_file = LOGIN_DIR / f'{platform}.code'
+        code_file = d / f'{platform}.code'
         try:
             code_file.unlink()
         except OSError:
             pass
-        cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'login',
+        cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'login', *base_args,
                '--qr-out', str(qr), '--status-file', str(status),
                '--sms-code-file', str(code_file), '--timeout', str(LOGIN_TIMEOUT)]
     else:
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'login-qr',
-               '--platform', cfg['wp'], '--qr-out', str(qr), '--status-file', str(status),
+               '--platform', cfg['wp'], *base_args, '--qr-out', str(qr), '--status-file', str(status),
                '--timeout', str(LOGIN_TIMEOUT)]
     # 新登录开始 → 清掉旧的 whoami 缓存（登录前可能缓存了「未登录」），避免登录成功后仍读到旧结果
     with _WHOAMI_LOCK:
-        _WHOAMI_CACHE.pop(platform, None)
-    log_path = LOGIN_DIR / f'{platform}.log'
+        _WHOAMI_CACHE.pop((platform, p), None)
+    log_path = d / f'{platform}.log'
     log_file = log_path.open('a', encoding='utf-8')
     proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
                             stdout=log_file, stderr=subprocess.STDOUT)
     log_file.close()
-    LOGIN_PROCESSES[platform] = proc
+    LOGIN_PROCESSES[(platform, p)] = proc
     for _ in range(50):
         await asyncio.sleep(0.5)
-        s = _login_status(platform)
+        s = _login_status(platform, p)
         if s['qr'] or s['state'] in ('qr_ready', 'success', 'error', 'expired'):
             return {'mode': 'qr', **s}
-    s = _login_status(platform)
+    s = _login_status(platform, p)
     return {'mode': 'qr', **s}
 
 
 @app.get("/api/login/{platform}/status")
-async def api_login_status(platform: str):
+async def api_login_status(platform: str, persona: str | None = None):
     if platform not in LOGIN_RUNNERS:
         raise HTTPException(404, '未知平台')
-    s = _login_status(platform)
+    p = _checked_persona(persona)
+    s = _login_status(platform, p)
     if s.get('state') == 'success':
         # 登录刚成功 → 清掉登录前缓存的「未登录」whoami 结果，令下次 whoami 重新真校验；
         # 否则卡片会因 WHOAMI_TTL(600s) 内的旧 false 持续显示「未登录」（本次视频号问题的根因）。
         # 只清缓存、不改任何登录/检测逻辑。
         with _WHOAMI_LOCK:
-            _WHOAMI_CACHE.pop(platform, None)
+            _WHOAMI_CACHE.pop((platform, p), None)
     return {'mode': 'qr', **s}
 
 
@@ -3145,7 +3226,7 @@ class SmsCodeRequest(BaseModel):
 
 
 @app.post("/api/login/{platform}/sms")
-async def api_login_sms(platform: str, req: SmsCodeRequest):
+async def api_login_sms(platform: str, req: SmsCodeRequest, persona: str | None = None):
     """回填短信验证码：写入 runner 轮询的一次性验证码文件（见 login_state.read_sms_code）。
 
     登录 runner 检测到风控短信墙时把状态置 sms_required，前端弹输入框，用户把手机
@@ -3153,11 +3234,13 @@ async def api_login_sms(platform: str, req: SmsCodeRequest):
     """
     if platform not in LOGIN_RUNNERS:
         raise HTTPException(404, '未知平台')
+    p = _checked_persona(persona)
     code = ''.join(ch for ch in (req.code or '') if ch.isdigit())
     if not (4 <= len(code) <= 8):
         raise HTTPException(400, '验证码应为 4-8 位数字')
-    LOGIN_DIR.mkdir(parents=True, exist_ok=True)
-    (LOGIN_DIR / f'{platform}.code').write_text(code, encoding='utf-8')
+    d = _persona_login_dir(p)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f'{platform}.code').write_text(code, encoding='utf-8')
     return {'ok': True}
 
 
@@ -3169,12 +3252,13 @@ class WechatCredentials(BaseModel):
 
 
 @app.get("/api/accounts/{platform}/credentials")
-async def api_get_credentials(platform: str):
+async def api_get_credentials(platform: str, persona: str | None = None):
     """读取凭证式平台（目前仅公众号）的已配置状态（AppID 脱敏，AppSecret 不回传）。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg or cfg.get('backend') != 'wechat-oa':
         raise HTTPException(404, '该平台不使用凭证登录')
-    acc = _wechat_web_account()
+    p = _checked_persona(persona)
+    acc = _wechat_web_account(p)
     app_id = acc.get('app_id', '') or ''
     return {
         'configured': bool(app_id and acc.get('app_secret')),
@@ -3185,42 +3269,44 @@ async def api_get_credentials(platform: str):
 
 
 @app.post("/api/accounts/{platform}/credentials")
-async def api_save_credentials(platform: str, req: WechatCredentials):
+async def api_save_credentials(platform: str, req: WechatCredentials, persona: str | None = None):
     """保存凭证式平台（公众号）的 AppID/AppSecret，写入 skill 配置并调官方接口验证。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg or cfg.get('backend') != 'wechat-oa':
         raise HTTPException(404, '该平台不使用凭证登录')
+    p = _checked_persona(persona)
     app_id = (req.appId or '').strip()
     app_secret = (req.appSecret or '').strip()
     if not app_id or not app_secret:
         raise HTTPException(400, 'AppID 和 AppSecret 都不能为空')
-    _wechat_save_credentials(app_id, app_secret, name=req.name.strip(), author=req.author.strip())
-    ok, msg = _wechat_verify_token()
+    _wechat_save_credentials(app_id, app_secret, name=req.name.strip(), author=req.author.strip(), persona=p)
+    ok, msg = _wechat_verify_token(p)
     with _WHOAMI_LOCK:
-        _WHOAMI_CACHE.pop(platform, None)
+        _WHOAMI_CACHE.pop((platform, p), None)
     if ok:
-        _write_login_marker(platform, 'success', req.name.strip() or '微信公众号')
+        _write_login_marker(platform, 'success', req.name.strip() or '微信公众号', p)
         return {'ok': True, 'message': '公众号凭证已保存并验证通过'}
     # 校验失败：凭证已存（下次改正后可直接重试），但明确告知失败原因（常见 40164 IP 白名单 / 40125 密钥错误）
     return {'ok': False, 'message': f'凭证已保存但验证未通过：{msg}。若是 40164 请把服务器出口 IP 加入公众号 IP 白名单。'}
 
 
-def _mp_login_status() -> dict:
-    """读公众号后台(mp)登录状态 + 二维码（文件由 weixin_mp_stats.py login 写）。"""
-    st = LOGIN_DIR / "wechat-oa-mp.json"
+def _mp_login_status(persona: str | None = None) -> dict:
+    """读公众号后台(mp)登录状态 + 二维码（文件由 weixin_mp_stats.py login 写，画像命名空间内）。"""
+    d = _persona_login_dir(persona)
+    st = d / "wechat-oa-mp.json"
     data = {"state": "unknown", "message": ""}
     if st.is_file():
         try:
-            d = json.loads(st.read_text(encoding="utf-8"))
-            data = {"state": d.get("state", "unknown"), "message": d.get("message", "")}
+            d_json = json.loads(st.read_text(encoding="utf-8"))
+            data = {"state": d_json.get("state", "unknown"), "message": d_json.get("message", "")}
         except Exception:
             pass
-    proc = LOGIN_PROCESSES.get("wechat-oa-mp")
+    proc = LOGIN_PROCESSES.get(("wechat-oa-mp", persona or ""))
     if data["state"] in ("unknown", "starting") and proc is not None and proc.poll() is not None:
-        data = {"state": "error", "message": f"登录程序退出（码 {proc.poll()}），见 outputs/_login/wechat-oa-mp.log"}
-    qr = LOGIN_DIR / "wechat-oa-mp.png"
+        data = {"state": "error", "message": f"登录程序退出（码 {proc.poll()}），见 outputs/{st.relative_to(OUTPUTS_DIR).as_posix().replace('.json', '.log')}"}
+    qr = d / "wechat-oa-mp.png"
     if qr.is_file():
-        data["qr"] = "_login/wechat-oa-mp.png"
+        data["qr"] = qr.relative_to(OUTPUTS_DIR).as_posix()
         try:
             data["qrTs"] = int(qr.stat().st_mtime)
         except OSError:
@@ -3232,90 +3318,97 @@ def _mp_login_status() -> dict:
 
 
 def _stop_mp_login_on_shutdown() -> None:
-    """正常重启 Web 时回收扫码进程，避免它继续写入下一次登录的状态。"""
-    proc = LOGIN_PROCESSES.pop("wechat-oa-mp", None)
-    if proc is not None and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-        _write_login_marker("wechat-oa-mp", "expired", "服务已重启，请重新扫码登录")
+    """正常重启 Web 时回收扫码进程（所有画像命名空间），避免它继续写入下一次登录的状态。"""
+    for key in [k for k in LOGIN_PROCESSES if k[0] == "wechat-oa-mp"]:
+        proc = LOGIN_PROCESSES.pop(key)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        _write_login_marker("wechat-oa-mp", "expired", "服务已重启，请重新扫码登录", key[1])
 
 
 @app.post("/api/accounts/{platform}/mp-login")
-async def api_mp_login_start(platform: str):
-    """启动「公众号后台」扫码登录（数据中心取数用，管理员级会话，独立于 AppID 凭证）。
+async def api_mp_login_start(platform: str, persona: str | None = None):
+    """启动「公众号后台」扫码登录（画像命名空间内；数据中心取数用，管理员级会话，独立于 AppID 凭证）。
     默认直连起 Playwright 出二维码；受限网络可设 EASEL_PROXY / https_proxy 走正向代理。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg or cfg.get("backend") != "wechat-oa":
         raise HTTPException(404, "该平台不使用公众号后台登录")
+    p = _checked_persona(persona)
     # 重复点击复用正在进行的登录，不能删除其二维码或启动第二个 Chromium。
-    proc = LOGIN_PROCESSES.get("wechat-oa-mp")
+    proc = LOGIN_PROCESSES.get(("wechat-oa-mp", p))
     if proc is not None and proc.poll() is None:
-        return {"mode": "qr", **_mp_login_status()}
-    LOGIN_DIR.mkdir(parents=True, exist_ok=True)
-    for f in (LOGIN_DIR / "wechat-oa-mp.png", LOGIN_DIR / "wechat-oa-mp.json"):
+        return {"mode": "qr", **_mp_login_status(p)}
+    d = _persona_login_dir(p)
+    d.mkdir(parents=True, exist_ok=True)
+    for f in (d / "wechat-oa-mp.png", d / "wechat-oa-mp.json"):
         try:
             f.unlink()
         except OSError:
             pass
     wx_proxy = os.environ.get("EASEL_PROXY") or os.environ.get("https_proxy") or ""
     cmd = [sys.executable, str(SHARED_SCRIPTS / "weixin_mp_stats.py"), "login",
-           "--proxy", wx_proxy, "--qr-out", str(LOGIN_DIR / "wechat-oa-mp.png"),
-           "--status-file", str(LOGIN_DIR / "wechat-oa-mp.json"), "--timeout", "240"]
-    log_file = (LOGIN_DIR / "wechat-oa-mp.log").open("a", encoding="utf-8")
+           "--proxy", wx_proxy, "--profile-base", str(_persona_browser_root(p)),
+           "--qr-out", str(d / "wechat-oa-mp.png"),
+           "--status-file", str(d / "wechat-oa-mp.json"), "--timeout", "240"]
+    log_file = (d / "wechat-oa-mp.log").open("a", encoding="utf-8")
     proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
                             stdout=log_file, stderr=subprocess.STDOUT)
     log_file.close()
-    LOGIN_PROCESSES["wechat-oa-mp"] = proc
+    LOGIN_PROCESSES[("wechat-oa-mp", p)] = proc
     for _ in range(60):
         await asyncio.sleep(0.5)
-        s = _mp_login_status()
+        s = _mp_login_status(p)
         if s["qr"] or s["state"] in ("qr_ready", "success", "error", "expired"):
             return {"mode": "qr", **s}
-    return {"mode": "qr", **_mp_login_status()}
+    return {"mode": "qr", **_mp_login_status(p)}
 
 
 @app.get("/api/accounts/{platform}/mp-login/status")
-async def api_mp_login_status(platform: str):
+async def api_mp_login_status(platform: str, persona: str | None = None):
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg or cfg.get("backend") != "wechat-oa":
         raise HTTPException(404, "该平台不使用公众号后台登录")
-    return {"mode": "qr", **_mp_login_status()}
+    p = _checked_persona(persona)
+    return {"mode": "qr", **_mp_login_status(p)}
 
 
 @app.get("/api/accounts/{platform}/whoami")
-async def api_account_whoami(platform: str):
-    """真校验登录态 + 读昵称/头像（起 headless 浏览器，数秒）。前端开页后台调用以自愈假阳性。
+async def api_account_whoami(platform: str, persona: str | None = None):
+    """真校验登录态 + 读昵称/头像（起 headless 浏览器，数秒；画像命名空间内）。前端开页后台调用以自愈假阳性。
     带 TTL 进程内缓存（避免账号页+工作台重复起浏览器）；确认已登录则回写标记，令快速路径自愈。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg:
         raise HTTPException(404, '未知平台')
+    p = _checked_persona(persona)
     backend = cfg['backend']
     if backend == 'unsupported':
         return {'loggedIn': False, 'name': '', 'avatar': ''}
     if backend == 'wechat-oa':
         # 不起浏览器：以 mp 后台会话/AppID 配置判断（见 _account_logged_in），名字取配置账号名
-        acc = _wechat_web_account()
-        return {'loggedIn': _account_logged_in(platform, cfg),
+        acc = _wechat_web_account(p)
+        return {'loggedIn': _account_logged_in(platform, cfg, p),
                 'name': acc.get('name', '') or '微信公众号', 'avatar': ''}
     # 命中未过期缓存直接返回
     with _WHOAMI_LOCK:
-        hit = _WHOAMI_CACHE.get(platform)
+        hit = _WHOAMI_CACHE.get((platform, p))
     if hit and (time.time() - hit[0]) < WHOAMI_TTL:
         return hit[1]
+    base_args = ['--profile-base', str(_persona_browser_root(p))]
     if backend == 'biliup':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'bili_login.py'), 'whoami',
-               '--cookie', str(PROJECT_ROOT / 'cookies.json')]
+               '--cookie', str(_bili_cookie_path(p))]
     elif backend == 'xhs':
-        cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'whoami', '--no-proxy']
+        cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'whoami', '--no-proxy', *base_args]
     elif backend == 'douyin':
-        cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'whoami']
+        cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'whoami', *base_args]
     else:
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'whoami',
-               '--platform', cfg['wp']]
+               '--platform', cfg['wp'], *base_args]
     try:
         proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
                                        capture_output=True, text=True, timeout=150)
@@ -3337,44 +3430,46 @@ async def api_account_whoami(platform: str):
     if not confident:
         # 校验失败/无有效输出 → **不缓存、不删标记**，返回「上次已知」登录态（读标记）。
         # 避免一次校验抖动就把已登录卡片翻成「未登录」并缓存 10 分钟；下次校验(缓存未写)会自动重试恢复。
-        return {'loggedIn': _account_logged_in(platform, cfg), 'name': '', 'avatar': ''}
+        return {'loggedIn': _account_logged_in(platform, cfg, p), 'name': '', 'avatar': ''}
     with _WHOAMI_LOCK:
-        _WHOAMI_CACHE[platform] = (time.time(), data)
+        _WHOAMI_CACHE[(platform, p)] = (time.time(), data)
     # 回写标记：确认已登录 → 快速路径（/api/accounts、/api/analytics/platforms）此后也正确；
     # biliup 走 cookies.json 判定，不用标记文件。
     if backend != 'biliup':
         if data['loggedIn']:
-            _write_login_marker(platform, 'success', data.get('name') or '')
+            _write_login_marker(platform, 'success', data.get('name') or '', p)
         else:
             try:
-                (LOGIN_DIR / f'{platform}.json').unlink()
+                (_persona_login_dir(p) / f'{platform}.json').unlink()
             except OSError:
                 pass
     return data
 
 
 @app.post("/api/logout/{platform}")
-async def api_logout(platform: str):
-    """退出登录：删持久化浏览器 profile + 登录状态/二维码/头像文件（biliup 删 cookies.json）。"""
+async def api_logout(platform: str, persona: str | None = None):
+    """退出登录（画像命名空间内）：删持久化浏览器 profile + 登录状态/二维码/头像文件（biliup 删 cookie）。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg:
         raise HTTPException(404, '未知平台')
+    p = _checked_persona(persona)
     deleted = []
     if cfg['backend'] == 'wechat-oa':
         # 1) 清 AppID 凭证（旧配置兜底）
-        _wechat_clear_credentials()
-        deleted.append('wechat-publisher.yaml:accounts.web')
+        _wechat_clear_credentials(p)
+        deleted.append(f"wechat-publisher.yaml:accounts.{_wechat_account_key(p)}")
         # 2) 停掉可能仍在跑的后台登录进程（避免它又写回 success 标记）
-        proc = LOGIN_PROCESSES.pop('wechat-oa-mp', None)
+        proc = LOGIN_PROCESSES.pop(('wechat-oa-mp', p), None)
         if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
             except Exception:
                 pass
         # 3) 删 AppID 标记 + mp 后台会话标记/二维码/日志（登录态判定看的就是 wechat-oa-mp.json）
+        d = _persona_login_dir(p)
         for name in (f'{platform}.json', f'{platform}.png',
                      'wechat-oa-mp.json', 'wechat-oa-mp.png', 'wechat-oa-mp.log'):
-            f = LOGIN_DIR / name
+            f = d / name
             try:
                 if f.is_file():
                     f.unlink()
@@ -3382,26 +3477,29 @@ async def api_logout(platform: str):
             except OSError:
                 pass
         # 4) 删 mp 后台浏览器持久化会话（真正退出登录）
-        mpdir = (BROWSER_PROFILES / 'WeixinMpProfile').resolve()
-        if BROWSER_PROFILES.resolve() in mpdir.parents and mpdir.is_dir():
+        root = _persona_browser_root(p)
+        mpdir = (root / 'WeixinMpProfile').resolve()
+        if root.resolve() in mpdir.parents and mpdir.is_dir():
             shutil.rmtree(mpdir, ignore_errors=True)
             deleted.append('WeixinMpProfile')
         with _WHOAMI_LOCK:
-            _WHOAMI_CACHE.pop(platform, None)
+            _WHOAMI_CACHE.pop((platform, p), None)
         return {'ok': True, 'deleted': deleted}
+    root = _persona_browser_root(p)
     prof_name = cfg.get('profile')
     if prof_name:
-        pdir = (BROWSER_PROFILES / prof_name).resolve()
-        if BROWSER_PROFILES.resolve() in pdir.parents and pdir.is_dir():
+        pdir = (root / prof_name).resolve()
+        if root.resolve() in pdir.parents and pdir.is_dir():
             shutil.rmtree(pdir, ignore_errors=True)
             deleted.append(prof_name)
     if cfg['backend'] == 'biliup':
-        ck = PROJECT_ROOT / 'cookies.json'
+        ck = _bili_cookie_path(p)
         if ck.is_file():
             ck.unlink()
-            deleted.append('cookies.json')
+            deleted.append(ck.name)
+    d = _persona_login_dir(p)
     for suffix in ('.json', '.png', '-me.png', '.code'):
-        f = LOGIN_DIR / f'{platform}{suffix}'
+        f = d / f'{platform}{suffix}'
         try:
             if f.is_file():
                 f.unlink()
@@ -3409,7 +3507,7 @@ async def api_logout(platform: str):
         except OSError:
             pass
     with _WHOAMI_LOCK:
-        _WHOAMI_CACHE.pop(platform, None)
+        _WHOAMI_CACHE.pop((platform, p), None)
     return {'ok': True, 'deleted': deleted}
 
 
@@ -3419,34 +3517,37 @@ ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-cha
 
 
 @app.get("/api/analytics/platforms")
-async def api_analytics_platforms():
-    """列出支持抓数据的平台 + 各自登录态（前端据此渲染平台选择器）。"""
+async def api_analytics_platforms(persona: str | None = None):
+    """列出支持抓数据的平台 + 各自登录态（画像命名空间内；前端据此渲染平台选择器）。"""
+    p = _checked_persona(persona)
     return [
         {"platform": pf, "name": LOGIN_RUNNERS.get(pf, {}).get("name", pf),
-         "loggedIn": _account_logged_in(pf, LOGIN_RUNNERS.get(pf, {}))}
+         "loggedIn": _account_logged_in(pf, LOGIN_RUNNERS.get(pf, {}), p)}
         for pf in LOGIN_RUNNERS if pf in ANALYTICS_PLATFORMS
     ]
 
 
 @app.get("/api/analytics/{platform}")
-async def api_analytics(platform: str):
-    """抓取某平台已登录账号的创作数据（粉丝/获赞/作品 + 与上次快照的增长）。起 headless 浏览器，数秒。"""
+async def api_analytics(platform: str, persona: str | None = None):
+    """抓取某平台已登录账号的创作数据（画像命名空间内；粉丝/获赞/作品 + 与上次快照的增长）。起 headless 浏览器，数秒。"""
     if platform not in ANALYTICS_PLATFORMS:
         raise HTTPException(404, "该平台暂不支持数据抓取")
+    p = _checked_persona(persona)
+    base_args = ["--profile-base", str(_persona_browser_root(p))]
     # B站用 cookie 调 API（无浏览器 profile）、公众号走 mp 后台会话（Playwright 拦截数据 XHR，见下），单独分支；其余走 account_stats（Playwright）
     if platform == "bilibili":
         cmd = [sys.executable, str(SHARED_SCRIPTS / "bili_login.py"), "stats",
-               "--cookie", str(PROJECT_ROOT / "cookies.json")]
+               "--cookie", str(_bili_cookie_path(p))]
     elif platform == "wechat-oa":
         # 公众号数据走「后台网页端」(mp.weixin.qq.com 管理员会话 + Playwright 拦截数据 XHR)：
         # 开发者 datacube 接口需认证+群发+接口权限，多数号取不到；后台端有登录态即可看到发表记录/数据。
         # 需先扫码登录 mp 后台（weixin_mp_stats.py login）；默认直连，受限网络才需 EASEL_PROXY/https_proxy。
         wx_proxy = os.environ.get("EASEL_PROXY") or os.environ.get("https_proxy") or ""
         cmd = [sys.executable, str(SHARED_SCRIPTS / "weixin_mp_stats.py"), "stats",
-               "--proxy", wx_proxy, "--count", "20"]
+               "--proxy", wx_proxy, *base_args, "--count", "20"]
     else:
         # 代理策略由 account_stats.py 按平台自定（xhs 直连、其它走 env），后端照常传 _proxy_env
-        cmd = [sys.executable, str(SHARED_SCRIPTS / "account_stats.py"), "fetch", "--platform", platform]
+        cmd = [sys.executable, str(SHARED_SCRIPTS / "account_stats.py"), "fetch", "--platform", platform, *base_args]
     ana_env = _proxy_env()
     try:
         proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=ana_env,
@@ -3473,6 +3574,7 @@ class PublishRequest(BaseModel):
     body: str = ''
     media: list[str] = []
     tags: str = ''
+    persona: str = ''   # 非空 = 用该画像绑定的账号发布；空 = 通用模式账号
 
 
 def _write_publish_status(status_file: Path, state: str, message: str = '') -> None:
@@ -3487,8 +3589,8 @@ def _write_publish_status(status_file: Path, state: str, message: str = '') -> N
         pass
 
 
-def _read_publish_status(platform: str) -> dict:
-    st = PUBLISH_DIR / f'{platform}.json'
+def _read_publish_status(platform: str, persona: str | None = None) -> dict:
+    st = _persona_publish_dir(persona) / f'{platform}.json'
     if st.is_file():
         try:
             d = json.loads(st.read_text(encoding='utf-8'))
@@ -3499,7 +3601,7 @@ def _read_publish_status(platform: str) -> dict:
 
 
 def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
-                    status_file: Path, code_file: Path) -> None:
+                    status_file: Path, code_file: Path, persona: str = '') -> None:
     """后台线程跑发布脚本（脚本自身把 starting/sms_required/verifying/success/error 写进 status_file）。
     结束后兜底补写终态 + 记 _publish.log + 成功则回流排期。"""
     ok = False
@@ -3520,7 +3622,7 @@ def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
     except Exception:
         pass
     # 脚本正常会写终态；异常/超时没写到时兜底补一个
-    if _read_publish_status(platform)['state'] not in ('success', 'error'):
+    if _read_publish_status(platform, persona)['state'] not in ('success', 'error'):
         _write_publish_status(status_file, 'success' if ok else 'error',
                               '发布成功' if ok else ('\n'.join((err or out).strip().splitlines()[-4:]) or '发布失败'))
     try:
@@ -3540,7 +3642,7 @@ def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
 
 
 def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: dict,
-                         status_file: Path, code_file: Path) -> dict:
+                         status_file: Path, code_file: Path, persona: str = '') -> dict:
     """启动异步发布：清旧码/状态 → 起后台线程 → 立即返回。前端轮询 /api/publish/{p}/status，
     遇 sms_required 弹输入框、提交到 /api/publish/{p}/sms。"""
     try:
@@ -3549,7 +3651,7 @@ def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: d
         pass
     _write_publish_status(status_file, 'starting', '发布中…（若触发风控会要求短信验证）')
     threading.Thread(target=_run_publish_bg,
-                     args=(platform, cmd, title, body, cfg, status_file, code_file),
+                     args=(platform, cmd, title, body, cfg, status_file, code_file, persona),
                      daemon=True).start()
     # 关键：**不返回 ok:true**——这只是「已启动」的应答，真正结果要靠轮询 /status。
     # 若这里给 ok:true，旧前端会把它当「已发布」立刻显示成功（假成功 bug，真机踩过）。
@@ -3557,32 +3659,36 @@ def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: d
 
 
 @app.get("/api/publish/{platform}/status")
-async def api_publish_status(platform: str):
-    """轮询异步发布状态：starting/sms_required/verifying/success/error。"""
+async def api_publish_status(platform: str, persona: str | None = None):
+    """轮询异步发布状态（画像命名空间内）：starting/sms_required/verifying/success/error。"""
     if platform not in LOGIN_RUNNERS:
         raise HTTPException(404, '未知平台')
-    return {'mode': 'publish', **_read_publish_status(platform)}
+    return {'mode': 'publish', **_read_publish_status(platform, _checked_persona(persona))}
 
 
 @app.post("/api/publish/{platform}/sms")
-async def api_publish_sms(platform: str, req: SmsCodeRequest):
-    """发布触发短信墙时回填验证码（写发布 runner 轮询的一次性验证码文件）。"""
+async def api_publish_sms(platform: str, req: SmsCodeRequest, persona: str | None = None):
+    """发布触发短信墙时回填验证码（写画像命名空间内、发布 runner 轮询的一次性验证码文件）。"""
     if platform not in LOGIN_RUNNERS:
         raise HTTPException(404, '未知平台')
+    p = _checked_persona(persona)
     code = ''.join(ch for ch in (req.code or '') if ch.isdigit())
     if not (4 <= len(code) <= 8):
         raise HTTPException(400, '验证码应为 4-8 位数字')
-    PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
-    (PUBLISH_DIR / f'{platform}.code').write_text(code, encoding='utf-8')
+    d = _persona_publish_dir(p)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f'{platform}.code').write_text(code, encoding='utf-8')
     return {'ok': True}
 
 
 @app.post("/api/publish/{platform}")
 async def api_publish(platform: str, req: PublishRequest):
-    """一键发布：分发到对应 publisher 脚本真发（--exec）。二次确认在前端。"""
+    """一键发布：分发到对应 publisher 脚本真发（--exec）。二次确认在前端。
+    req.persona 非空时用该画像绑定的账号（--profile-base / 画像 cookie）。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg:
         raise HTTPException(404, '未知平台')
+    p = _checked_persona(req.persona or None)
     backend = cfg['backend']
     if backend == 'unsupported':
         raise HTTPException(400, f"{cfg['name']} 暂不支持一键发布")
@@ -3605,46 +3711,49 @@ async def api_publish(platform: str, req: PublishRequest):
     title = req.title.strip() or req.body.strip()[:20]
     tags = req.tags or ''
     py = sys.executable
+    base_args = ['--profile-base', str(_persona_browser_root(p))]
     if platform == 'xiaohongshu':
         base = [py, str(SHARED_SCRIPTS / 'xhs_publish.py')]
-        cmd = base + ['publish-video', '--no-proxy', '--video', vids[0]] if vids else base + ['publish', '--no-proxy', '--images', ','.join(imgs)]
+        cmd = base + ['publish-video', '--no-proxy', '--video', vids[0], *base_args] if vids else base + ['publish', '--no-proxy', '--images', ','.join(imgs), *base_args]
         cmd += ['--title', title, '--content', req.body, '--tags', tags, '--exec']
     elif platform == 'bilibili':
-        # B站投稿：直接调 biliup CLI（需 cookies.json，PATH 上有 biliup）。必须视频；
+        # B站投稿：直接调 biliup CLI（需登录 cookie，PATH 上有 biliup）。必须视频；
         # tid=36「知识」；B站投稿必须≥1 标签，无则兜底「日常」。
         bili_tag = tags.replace('#', '').replace('，', ',').strip().strip(',') or '日常'
-        cmd = ['biliup', '-u', str(PROJECT_ROOT / 'cookies.json'), 'upload', vids[0],
+        cmd = ['biliup', '-u', str(_bili_cookie_path(p)), 'upload', vids[0],
                '--title', title[:80], '--tid', '36', '--copyright', '1', '--tag', bili_tag]
         if req.body.strip():
             cmd += ['--desc', req.body[:2000]]
     elif platform == 'douyin':
         base = [py, str(SHARED_SCRIPTS / 'douyin_publish.py')]
-        cmd = base + ['publish-video', '--no-proxy', '--video', vids[0]] if vids else base + ['publish', '--no-proxy', '--images', ','.join(imgs)]
+        cmd = base + ['publish-video', '--no-proxy', '--video', vids[0], *base_args] if vids else base + ['publish', '--no-proxy', '--images', ','.join(imgs), *base_args]
         cmd += ['--title', title, '--content', req.body, '--tags', tags, '--exec']
         # 抖音发布可能触发风控短信墙——异步跑 + 状态/验证码文件，前端轮询到 sms_required 时弹输入框
-        PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
-        status_file = PUBLISH_DIR / 'douyin.json'
-        code_file = PUBLISH_DIR / 'douyin.code'
+        d = _persona_publish_dir(p)
+        d.mkdir(parents=True, exist_ok=True)
+        status_file = d / 'douyin.json'
+        code_file = d / 'douyin.code'
         cmd += ['--status-file', str(status_file), '--sms-code-file', str(code_file)]
-        return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file)
+        return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file, p)
     elif platform == 'wechat-oa':
         # 微信公众号：走「后台会话」发布（免 AppID/AppSecret、免 IP 白名单）。
         # 正文 MD → 公众号 HTML（skill 排版器）→ 会话建草稿（weixin_mp_stats.py publish，内嵌图传 mp CDN）。
-        if _mp_login_status().get('state') != 'success':
+        if _mp_login_status(p).get('state') != 'success':
             raise HTTPException(400, '公众号后台未登录：请先在账号页点「登录公众号后台」扫码')
         if not imgs:
             raise HTTPException(400, '公众号文章需要一张封面图，请附带至少一张图片')
         if vids:
             raise HTTPException(400, '公众号发图文文章，请附带封面/正文图片而非视频')
         cover = imgs[0]
-        PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
+        d = _persona_publish_dir(p)
+        d.mkdir(parents=True, exist_ok=True)
         stamp = uuid.uuid4().hex[:12]
-        md_path = PUBLISH_DIR / f'wechat-oa-{stamp}.md'
-        html_path = PUBLISH_DIR / f'wechat-oa-{stamp}.html'
+        md_path = d / f'wechat-oa-{stamp}.md'
+        html_path = d / f'wechat-oa-{stamp}.html'
         body_md = req.body or ''
         extra_imgs = imgs[1:]
         if extra_imgs:
-            body_md += "\n\n" + "\n\n".join(f'![]({p})' for p in extra_imgs)
+            body_md += "\n\n" + "\n\n".join(f'![]({p2})' for p2 in extra_imgs)
         md_path.write_text(f"# {title}\n\n{body_md}\n", encoding='utf-8')
         conv = subprocess.run([py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
                                str(md_path), '-o', str(html_path)],
@@ -3653,13 +3762,13 @@ async def api_publish(platform: str, req: PublishRequest):
         if conv.returncode != 0 or not html_path.is_file():
             raise HTTPException(500, f"排版失败：{(conv.stderr or conv.stdout or '')[-200:]}")
         wx_proxy = os.environ.get('EASEL_PROXY') or os.environ.get('https_proxy') or ''
-        cmd = [py, str(SHARED_SCRIPTS / 'weixin_mp_stats.py'), 'publish', '--proxy', wx_proxy,
+        cmd = [py, str(SHARED_SCRIPTS / 'weixin_mp_stats.py'), 'publish', '--proxy', wx_proxy, *base_args,
                '--html', str(html_path), '--cover', cover, '--title', title,
                '--digest', (req.body or '').strip()[:100], '--author', '']
     else:
         cmd = [py, str(SHARED_SCRIPTS / 'web_publisher.py'), 'publish',
                '--platform', cfg['wp'], '--title', title, '--desc', req.body,
-               '--tags', tags, '--exec']
+               '--tags', tags, *base_args, '--exec']
         media = vids[0] if vids else (imgs[0] if imgs else None)
         if media:
             cmd += ['--media', media]

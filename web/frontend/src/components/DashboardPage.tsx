@@ -8,7 +8,7 @@ import type {
   AnalyticsPlatform, AccountAnalytics, AccountWhoami,
 } from '../lib/api';
 import type { Page } from './Sidebar';
-import { getWhoamiCache, verifyStale } from '../lib/whoami';
+import { getWhoamiCache, verifyStale, whoamiKey } from '../lib/whoami';
 import {
   IconFire, IconCalendar, IconOutputs, IconChat, IconSkills, IconAccounts,
   IconIdea, IconPublish,
@@ -55,33 +55,36 @@ export default function DashboardPage({ persona, gatewayStatus, onNavigate, onUs
   const [whoamiMap, setWhoamiMap] = useState<Record<string, AccountWhoami>>(() => getWhoamiCache());
 
   useEffect(() => {
+    // 多画像多账号：账号/统计都读当前画像命名空间内的登录态
+    const p = persona || undefined;
     fetchTrends('weibo,douyin', 6).then((d) => setTrends(d.trends)).catch(() => {});
     fetchSchedule().then(setSchedule).catch(() => {});
     fetchOutputs().then(setOutputs).catch(() => {});
-    fetchAccounts().then(setAccounts).catch(() => {});
+    fetchAccounts(p).then(setAccounts).catch(() => {});
     fetchIdeas().then(setIdeas).catch(() => {});
-    fetchAnalyticsPlatforms().then((ps) => {
+    fetchAnalyticsPlatforms(p).then((ps) => {
       setAnaPlats(ps);
       const cache = getWhoamiCache();
-      const isLog = (p: AnalyticsPlatform) => p.loggedIn || !!cache[p.platform]?.loggedIn;
+      const isLog = (plat: AnalyticsPlatform) => plat.loggedIn || !!cache[whoamiKey(plat.platform, p)]?.loggedIn;
       const first = ps.find(isLog);
       if (first) setAnaSel((s) => s || first.platform);
       // 开页后台自愈：对非 API 式的归因平台真校验（whoami），刷新登录态；
       // B 站走 cookie、公众号走凭证/官方 API 判定，都不起浏览器。
       const API_BASED = new Set(['bilibili', 'wechat-oa']);
-      verifyStale(ps.filter((p) => !API_BASED.has(p.platform)).map((p) => p.platform), {
+      verifyStale(ps.filter((plat) => !API_BASED.has(plat.platform)).map((plat) => plat.platform), {
+        persona: p,
         onUpdate: (platform, r) => {
-          setWhoamiMap((m) => ({ ...m, [platform]: r }));
+          setWhoamiMap((m) => ({ ...m, [whoamiKey(platform, p)]: r }));
           if (r.loggedIn) setAnaSel((s) => s || platform);
         },
       });
     }).catch(() => {});
-  }, []);
+  }, [persona]);
 
   const runAna = (platform: string) => {
     setAnaSel(platform);
     setAnaData((d) => ({ ...d, [platform]: 'loading' }));
-    fetchAccountAnalytics(platform)
+    fetchAccountAnalytics(platform, persona || undefined)
       .then((r) => setAnaData((d) => {
         const next = { ...d, [platform]: r };
         try { localStorage.setItem('easel_analytics', JSON.stringify(next)); } catch { /* quota */ }
@@ -220,7 +223,7 @@ export default function DashboardPage({ persona, gatewayStatus, onNavigate, onUs
             )}
           </div>
           {(() => {
-            const logged = anaPlats.filter((p) => p.loggedIn || whoamiMap[p.platform]?.loggedIn);
+            const logged = anaPlats.filter((p) => p.loggedIn || whoamiMap[whoamiKey(p.platform, persona || undefined)]?.loggedIn);
             if (anaPlats.length === 0) return <div className="dash-empty">加载中 / 需配置代理</div>;
             if (logged.length === 0) {
               return (

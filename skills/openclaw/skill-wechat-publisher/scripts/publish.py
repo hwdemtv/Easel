@@ -164,10 +164,12 @@ def _default_temp_dir() -> str:
     return tempfile.mkdtemp(prefix="wechat_images_")
 
 
-def _session_publish_html(html_content, cover_path, title, digest="", author="", base_dir=None):
+def _session_publish_html(html_content, cover_path, title, digest="", author="", base_dir=None,
+                          profile_base=None):
     """会话式发布：把 HTML 写进 base_dir（让正文相对图能被解析），调
     shared/scripts/weixin_mp_stats.py publish（走公众号后台会话，免 app_secret/免 IP 白名单，
-    正文内嵌图自动传 mp CDN）。返回 {media_id,...}。"""
+    正文内嵌图自动传 mp CDN）。返回 {media_id,...}。
+    profile_base：多画像多账号——画像 X 传 ~/.easel-browser-profiles/X，用该画像扫码的后台会话。"""
     import subprocess as _sp
     import os as _os
     shared = Path(__file__).resolve().parents[3] / "shared" / "scripts"
@@ -182,6 +184,8 @@ def _session_publish_html(html_content, cover_path, title, digest="", author="",
     cmd = [sys.executable, str(shared / "weixin_mp_stats.py"), "publish", "--proxy", proxy,
            "--html", str(html_tmp), "--cover", str(cover_path), "--title", title,
            "--digest", digest or "", "--author", author or ""]
+    if profile_base:
+        cmd += ["--profile-base", str(profile_base)]
     proc = _sp.run(cmd, capture_output=True, text=True, timeout=300)
     for line in reversed((proc.stdout or "").strip().splitlines()):
         line = line.strip()
@@ -217,6 +221,7 @@ def publish_from_markdown(
     skip_ai_score: bool = False,
     allow_missing_images: bool = False,
     session_mode: bool = True,
+    profile_base: Optional[str] = None,
     debug: bool = False,
 ):
     """
@@ -340,7 +345,7 @@ def publish_from_markdown(
         if not cov or not Path(cov).exists():
             print("  错误：需要封面图（--cover 或正文第一张本地图片）"); sys.exit(1)
         result = _session_publish_html(html_content, cov, title, digest, author or "",
-                                       base_dir=md_path.parent)
+                                       base_dir=md_path.parent, profile_base=profile_base)
         print("\n" + "=" * 60)
         print("发布完成（会话式）！")
         print(f"  草稿 media_id: {result['media_id']}")
@@ -750,6 +755,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--account", help="指定公众号账号（对应 wechat-publisher.yaml 中的账号名）")
     parser.add_argument(
+        "--profile-base",
+        help="后台会话登录态根目录（多画像多账号：画像 X 传 ~/.easel-browser-profiles/X）",
+    )
+    parser.add_argument(
         "--sync",
         help="可选:发到微信后同步到其他平台,逗号分隔(如 zhihu,juejin,csdn)。"
              "覆盖 --sync-from-config。需先装 @wechatsync/cli 并配置 WECHATSYNC_MCP_TOKEN",
@@ -893,7 +902,8 @@ def main():
             html_content = Path(args.html).read_text(encoding="utf-8")
             result = _session_publish_html(html_content, args.cover, args.title,
                                            args.digest or "", args.author or "",
-                                           base_dir=Path(args.html).parent)
+                                           base_dir=Path(args.html).parent,
+                                           profile_base=args.profile_base)
         else:
             result = publish_from_html(
                 html_path=args.html,
@@ -919,6 +929,7 @@ def main():
             skip_ai_score=args.skip_ai_score,
             allow_missing_images=args.allow_missing_images,
             session_mode=not args.official_api,
+            profile_base=args.profile_base,
             debug=args.debug,
         )
     else:

@@ -46,3 +46,14 @@ python $WP publish --platform zhihu --title "标题" --desc "正文..." --exec -
 ## 参考来源
 
 知乎专栏写作页网页流程；复用统一 Playwright 框架。正文 Draft.js 编辑器，选择器按现状维护。
+
+## 多画像多账号（画像绑定独立账号）
+
+当会话声明了当前画像（如「我当前使用的画像是『X』」）时，每个画像可绑定**一套独立的平台账号**：
+Web「账号」页选中画像 X 后扫码登录，登录态即存入 `~/.easel-browser-profiles/X/`（与通用账号、
+其它画像互不影响）。**凡当前画像非空，登录/发布/取数命令必须追加对应画像参数**；画像为空
+（通用模式）时按默认路径执行、不带这些参数：
+
+- `web_publisher.py` 全部子命令（login/login-qr/publish/whoami）追加 `--profile-base "$HOME/.easel-browser-profiles/X"`。
+
+当前画像的登录态在 `~/.easel-browser-profiles/X/ZhihuProfile`。

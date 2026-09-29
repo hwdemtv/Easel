@@ -75,9 +75,9 @@ export default function PublishPage({ persona }: PublishPageProps) {
 
   useEffect(() => () => adaptCtl.current?.abort(), []);   // 离开页面中止流
 
-  // 登录态 + 可选媒体列表
+  // 登录态 + 可选媒体列表（登录态按当前画像命名空间读；切画像即换一套账号）
   useEffect(() => {
-    fetchAccounts().then(setAccounts).catch(() => { /* 忽略 */ });
+    fetchAccounts(persona || undefined).then(setAccounts).catch(() => { /* 忽略 */ });
     fetchOutputs().then((roots) => {
       const files: OutputFile[] = [];
       const walk = (n: OutputFile) => {
@@ -88,7 +88,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
       files.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
       setMediaFiles(files);
     }).catch(() => { /* 忽略 */ });
-  }, []);
+  }, [persona]);
 
   const loginOf = (key: string) => accounts.find((a) => a.platform === key)?.loggedIn ?? false;
 
@@ -192,6 +192,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
     const okToSend = window.confirm(
       `发布前预检已执行，结果已显示在页面中。人设评分只做提醒，不会阻止发布。\n\n` +
       `即将【真实发布】到：${targets.map((t) => t.label).join('、')}。\n` +
+      (persona ? `使用画像「${persona}」绑定的账号。\n` : '使用通用账号（未选画像）。\n') +
       `这会公开发布到你的账号，确定继续？`);
     if (!okToSend) return;
 
@@ -211,7 +212,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
       }
       setPub((r) => ({ ...r, [t.key]: { status: 'publishing', msg: '发布中…可能需 1-2 分钟' } }));
       try {
-        const res = await publishNow(t.key, { title, body: effective(t.key), media: selectedMedia, tags });
+        const res = await publishNow(t.key, { title, body: effective(t.key), media: selectedMedia, tags, persona });
         if (res.async) {
           // 抖音：异步发布，轮询状态；风控触发短信墙时弹输入框（条件触发，没触发就直接跑完）
           await pollAsyncPublish(t.key, t.label);
@@ -241,7 +242,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
         resolve(); return;
       }
       let s;
-      try { s = await publishStatus(key); } catch { return; }  // 单次失败忽略
+      try { s = await publishStatus(key, persona || undefined); } catch { return; }  // 单次失败忽略
       if (s.state === 'sms_required' || s.state === 'verifying') {
         setPubSms({ platform: key, name: label, state: s.state, message: s.message });
         setPub((r) => ({ ...r, [key]: { status: 'publishing', msg: s.message || '需短信验证' } }));
@@ -265,7 +266,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
     if (code.length < 4) { showToast('验证码应为 4-6 位数字'); return; }
     setPubSmsBusy(true);
     try {
-      await submitPublishSms(pubSms.platform, code);
+      await submitPublishSms(pubSms.platform, code, persona || undefined);
       setPubSmsCode('');
       setPubSms((p) => p && ({ ...p, state: 'verifying', message: '正在验证验证码…' }));
     } catch (e) {

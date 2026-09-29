@@ -112,9 +112,10 @@ export default function ProfilePage({ persona, onNewProfile, onDeleted }: Profil
   const handleFetchWechat = async (filename: string) => {
     setFetchingWx(true);
     try {
-      const a = await fetchAccountAnalytics('wechat-oa');
+      // 用「当前编辑的这个画像」绑定的公众号账号抓数（多画像多账号）
+      const a = await fetchAccountAnalytics('wechat-oa', persona || undefined);
       if (!a.loggedIn) {
-        showToast('公众号后台未登录：请先到「账号」页扫码登录后再抓取');
+        showToast('公众号后台未登录：请先到「账号」页选中该画像后扫码登录，再来抓取');
         return;
       }
       const base = files.find((f) => f.filename === filename)?.content ?? '';
