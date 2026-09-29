@@ -511,6 +511,42 @@ _LOCAL_ORIGINS = [f'http://{host}:{port}'
 _LOCAL_ORIGINS += [o.strip() for o in os.environ.get('EASEL_EXTRA_ORIGINS', '').split(',') if o.strip()]
 _EXTRA_HOSTS = [h.strip() for h in os.environ.get('EASEL_EXTRA_HOSTS', '').split(',') if h.strip()]
 
+
+def _own_lan_hosts() -> list[str]:
+    """本机对外可达的地址：UDP 连接法让内核选默认路由的源地址（不会真发包），
+    再用 getaddrinfo(gethostname) 兜底。返回 IPv4 字符串（排除回环）。"""
+    hosts: list[str] = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('10.255.255.255', 1))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith('127.'):
+                hosts.append(ip)
+        finally:
+            s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith('127.') and ip not in hosts:
+                hosts.append(ip)
+    except OSError:
+        pass
+    return hosts
+
+
+# Easel 常整箱部署在局域网工作站上，从本机局域网 IP 打开工作台（README 的 LAN 直链
+# 交付）是设计内用法；e1195dc 收紧后只认回环地址，这些访问会被 TrustedHostMiddleware
+# 拒成「Invalid host header」、写请求被 local_write_guard 拒成 403。本机自己的网卡
+# IP / 主机名自动放行——DHCP 换 IP 也无需改配置。DNS rebinding 攻击者的 Origin/Host
+# 是他自己的域名（不会变成本机地址），放行本机地址不削弱上述两道防护。
+for _h in [*_own_lan_hosts(), socket.gethostname().lower()]:
+    if _h and _h not in ('localhost',) and _h not in _EXTRA_HOSTS:
+        _EXTRA_HOSTS.append(_h)
+        _LOCAL_ORIGINS.extend(f'http://{_h}:{_p}' for _p in _LOCAL_PORTS)
+
 # VSCode/code-server 等远程开发环境常通过 VSCODE_PROXY_URI 这个反代域名访问 Easel
 # （真实连接仍是本机回环，代理在同一台机器上转发）；不识别这个域名会让通过代理
 # 打开的页面从第一个请求起就被下面的 TrustedHostMiddleware/CORS 拒绝——收紧前
