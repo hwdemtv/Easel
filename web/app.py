@@ -3227,6 +3227,18 @@ async def api_login_start(platform: str, persona: str | None = None):
     # 新登录开始 → 清掉旧的 whoami 缓存（登录前可能缓存了「未登录」），避免登录成功后仍读到旧结果
     with _WHOAMI_LOCK:
         _WHOAMI_CACHE.pop((platform, p), None)
+    # 同一命名空间重复点「登录」→ 先终止上一个 runner：两个 Chromium 抢同一 user-data-dir
+    # 会日志交错/状态互踩（真机视频号踩过：旧 runner 挂着不退，差点把 success 标记覆盖成 expired）。
+    old = LOGIN_PROCESSES.get((platform, p))
+    if old is not None and old.poll() is None:
+        try:
+            old.terminate()
+            try:
+                old.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                old.kill()
+        except Exception:
+            pass
     log_path = d / f'{platform}.log'
     log_file = log_path.open('a', encoding='utf-8')
     proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),

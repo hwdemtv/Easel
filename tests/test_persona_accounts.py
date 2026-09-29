@@ -197,6 +197,39 @@ def test_delete_persona_purges_credentials(tmp_ns, monkeypatch):
     assert not (tmp_ns / 'profiles' / 'P1').exists()
 
 
+def test_relogin_terminates_previous_runner(tmp_ns, monkeypatch):
+    """同一画像命名空间重复点「登录」必须终止上一个 runner——两个 Chromium 抢同一
+    user-data-dir 会日志交错/状态互踩（真机视频号：旧 runner 挂着差点覆盖 success 标记）。"""
+    import asyncio as _asyncio
+
+    procs = []
+
+    def fake_popen(cmd, **kw):
+        m = Mock()
+        m.poll.return_value = None          # 永远「活着」
+        m.terminate = Mock()
+        m.wait = Mock()
+        procs.append(m)
+        return m
+
+    monkeypatch.setattr(web.subprocess, 'Popen', fake_popen)
+    # 轮询循环 50×0.5s：把 sleep 打成 no-op，测试秒回
+    async def _fast_sleep(_s):
+        return None
+    monkeypatch.setattr(web.asyncio, 'sleep', _fast_sleep)
+    client = TestClient(web.app, base_url='http://127.0.0.1:7860', client=LOOPBACK)
+    r1 = client.post('/api/login/zhihu', params={'persona': 'P1'})
+    assert r1.status_code == 200, r1.text
+    r2 = client.post('/api/login/zhihu', params={'persona': 'P1'})
+    assert r2.status_code == 200, r2.text
+    procs[0].terminate.assert_called_once()   # 旧 runner 被终止
+    assert web.LOGIN_PROCESSES[('zhihu', 'P1')] is procs[1]
+    # 不同画像命名空间互不影响
+    r3 = client.post('/api/login/zhihu')
+    assert r3.status_code == 200, r3.text
+    procs[1].terminate.assert_not_called()
+
+
 def test_publish_request_accepts_persona_field(tmp_ns, monkeypatch):
     """PublishRequest.persona 非空时用画像账号（子进程参数带画像根）；校验失败路径不落盘。"""
     fake = Mock()

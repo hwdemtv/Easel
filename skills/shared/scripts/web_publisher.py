@@ -1126,7 +1126,16 @@ def cmd_login_qr(a) -> int:
             args=LAUNCH_ARGS + ["--no-proxy-server"])
         page = browser.pages[0] if browser.pages else browser.new_page()
         try:
-            page.goto(cfg["login_url"], wait_until="domcontentloaded")
+            # 首开偶发 30s 卡死（真机视频号踩过：连点三次登录一次超时，服务器 curl 同址秒通——
+            # 站点对 headless 偶发挂起，属瞬时抖动）。重试最多 3 次再判死，别让一次抖动报废整轮扫码。
+            for _attempt in range(3):
+                try:
+                    page.goto(cfg["login_url"], wait_until="domcontentloaded")
+                    break
+                except Exception as _e:  # noqa: BLE001
+                    print(f"⚠️ 打开登录页失败（第 {_attempt + 1}/3 次重试）：{_e}", file=sys.stderr)
+                    if _attempt == 2:
+                        raise
             # 给客户端 redirect + 登录态渲染时间：已登录常从入口页跳到 /profile 等，
             # 固定 1.2s 经常不够（快手实测 → 误判未登录去截整页）。等 login_check 出现最多 6s。
             try:
