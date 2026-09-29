@@ -110,7 +110,7 @@ def cmd_serve(rd: Path, base_port: int) -> int:
     if not cards.is_file():
         print(f"缺卡面文件：{cards}", file=sys.stderr)
         return 1
-    BLACKLIST = {3000, 3001, 3002, 7860, 18789, 8822, 8899}  # 端口矩阵：不占
+    BLACKLIST = {3000, 3001, 3002, 7860, 37289, 8822, 8899}  # 端口矩阵：不占
     port = base_port
     for _ in range(40):
         if port in BLACKLIST:

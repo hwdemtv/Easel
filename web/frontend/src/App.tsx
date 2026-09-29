@@ -186,7 +186,7 @@ export default function App() {
   // ---- 流式对话：状态与生命周期都放在 App（永不卸载），切页/切 ChatPage 都不中断/丢失 ----
   const [streams, setStreams] = useState<Record<string, StreamState>>({});
   const streamCtl = useRef<Record<string, AbortController>>({});
-  const streamAcc = useRef<Record<string, { content: string; thinking: string; steps: string[]; questions: ChatQuestion[] }>>({});
+  const streamAcc = useRef<Record<string, { content: string; thinking: string; steps: string[]; questions: ChatQuestion[]; finalText?: string }>>({});
   const answeredRef = useRef<Set<string>>(new Set());   // 已提交答案的 question id：重放/恢复不再重现
   // ---- 打字机：分批到达的 token 按节奏吐给界面 ----
   const typingBuf = useRef<Record<string, string>>({});
@@ -262,7 +262,7 @@ export default function App() {
       const next = prev.map((s) => (s.id === sessionId ? { ...s, pendingTurnId: turnId } : s));
       saveSessions(next); return next;
     });
-    streamAcc.current[sessionId] = { content: '', thinking: '', steps: [], questions: [] };
+    streamAcc.current[sessionId] = { content: '', thinking: '', steps: [], questions: [], finalText: undefined };
     setStreams((prev) => ({ ...prev, [sessionId]: { content: '', thinking: '', activity: '', questions: [] } }));
     // 打字机队列：流式事件按批到达（OpenClaw 攒批），前端按字符节奏显示，体验逐字浮现。
     typingBuf.current[sessionId] = '';
@@ -285,7 +285,7 @@ export default function App() {
           }
           const a = streamAcc.current[sessionId];
           appendAssistant(sessionId, {
-            role: 'assistant', content: a?.content || '',
+            role: 'assistant', content: a?.finalText || a?.content || '',
             thinking: a?.thinking || undefined, activity: a?.steps.join('\n') || undefined,
           }, sessionKey);
           clearStream(sessionId);
@@ -351,6 +351,14 @@ export default function App() {
       },
       // onHeartbeat：防呆心跳（30s 静默）。只设独立的「未卡住」提示，绝不写 activity/thinking → 不顶掉真实状态。
       (note) => setStreams((p) => (p[sessionId] ? { ...p, [sessionId]: { ...p[sessionId], stillWorking: note } } : p)),
+      // onFinalText：message_end 自带网关按块序拼好的干净全文。GLM 思考型模型多 text 块
+      // 交错到达，打字机按到达顺序拼出的正文可能乱序——以网关全文为准替换。
+      (finalText) => {
+        const a = streamAcc.current[sessionId]; if (!a) return;
+        a.finalText = finalText;
+        typingBuf.current[sessionId] = '';
+        setStreams((p) => (p[sessionId] ? { ...p, [sessionId]: { ...p[sessionId], content: finalText } } : p));
+      },
     );
   }, [appendAssistant, clearStream]);
 
@@ -362,7 +370,7 @@ export default function App() {
     if (!last || last.role !== 'user') return;   // 没有悬空的用户消息 = 无需恢复
     let turnId = s.pendingTurnId;
     try { turnId = sessionStorage.getItem(`easel_pending_turn:${sessionId}`) || turnId; } catch { /* use persisted id */ }
-    streamAcc.current[sessionId] = { content: '', thinking: '', steps: [], questions: [] };
+    streamAcc.current[sessionId] = { content: '', thinking: '', steps: [], questions: [], finalText: undefined };
     setStreams((p) => ({ ...p, [sessionId]: { content: '', thinking: '', activity: '⏳ 正在接回上一轮结果…', questions: [] } }));
     typingBuf.current[sessionId] = '';
     startTypingPump(sessionId);

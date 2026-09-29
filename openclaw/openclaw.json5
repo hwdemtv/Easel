@@ -30,6 +30,6 @@
   // ---- Gateway ----
   gateway: {
     bind: "lan",  // 容器内绑定所有接口
-    port: 18789,
+    port: 18901,
   },
 }

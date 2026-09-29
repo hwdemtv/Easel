@@ -507,8 +507,150 @@ def _normalize_content(text: str) -> str:
     return text.strip("\n")
 
 
-def _fill_and_submit(page, title, content, tags):
-    """标题→正文→话题→长度校验→发布→成功校验。"""
+def _confirm_draft_dialog(page) -> None:
+    """点暂存后若弹确认框（如「笔记将存入草稿箱」），点其确认按钮（保守：文案匹配才点）。"""
+    kws = ("存入草稿箱", "存草稿", "保存草稿", "确认暂存", "暂存并离开", "确认", "确定")
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        for b in page.query_selector_all("button, .d-button, [role=button]"):
+            try:
+                if not b.is_visible():
+                    continue
+                tx = (b.inner_text() or "").strip()
+                if tx in kws:
+                    b.click()
+                    page.wait_for_timeout(1000)
+                    return
+            except Exception:
+                pass
+        page.wait_for_timeout(500)
+
+
+def _wait_draft_saved(page, timeout_s: int = 30) -> None:
+    """草稿保存成功校验：跳离发布页 / 出现「草稿/暂存/成功」提示 / 表单复位，任一即可。"""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if "/publish/publish" not in page.url:
+            print(f"✅ 草稿已保存，已跳离发布页：{page.url}")
+            return
+        for sel in (".d-message", ".d-toast", "[class*=toast]", "[class*=message]",
+                    "[class*=modal]", "[role=dialog]"):
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    t = el.inner_text() or ""
+                    if ("草稿" in t) or ("暂存" in t) or ("成功" in t):
+                        print(f"✅ 草稿已保存（提示：{t.strip()[:40]}）")
+                        return
+            except Exception:
+                pass
+        try:
+            if (not page.query_selector(SELECTORS["title_input"])
+                    and not page.query_selector(SELECTORS["img_preview"])):
+                print("✅ 草稿已保存（编辑表单已清空复位）")
+                return
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    _die("草稿未确认保存：点暂存后未跳离/未见提示。" + _diag_after_publish(page))
+
+
+def _draft_click_via_shadow(page) -> bool:
+    """穿透 xhs-publish-btn 的(open)Shadow Root 找「暂存/草稿」叶子按钮，按几何坐标点。闭合 root 返回 None 则失败。"""
+    js = """
+    () => {
+      const hosts = document.querySelectorAll('xhs-publish-btn');
+      for (const h of hosts) {
+        const root = h.shadowRoot;
+        if (!root) continue;
+        const els = root.querySelectorAll('button, [class*=btn], [class*=button], div, span');
+        let best = null;
+        for (const el of els) {
+          const t = (el.textContent || '').trim();
+          if ((t.includes('暂存') || t.includes('草稿')) && t.length <= 8) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0 && (!best || r.width * r.height < best.area)) {
+              best = {x: r.x + r.width / 2, y: r.y + r.height / 2, text: t, area: r.width * r.height};
+            }
+          }
+        }
+        if (best) return best;
+      }
+      return null;
+    }
+    """
+    try:
+        info = page.evaluate(js)
+    except Exception:
+        return False
+    if info:
+        print(f"  [shadow] 命中暂存按钮「{info['text']}」@ ({info['x']:.0f},{info['y']:.0f})")
+        page.mouse.click(info["x"], info["y"])
+        return True
+    return False
+
+
+def _click_draft_and_confirm(page) -> None:
+    """点「暂存离开/存草稿」把笔记存进草稿箱（--draft 模式）。
+    新版 xhs-publish-btn 为闭合 Shadow DOM 横条，内含[暂存离开][发布]两按钮，
+    暂存在左（实测约 39% 处，发布在 62%），按坐标点；可读到的文案按钮优先按文案匹配。"""
+    for kw in ("暂存离开", "存草稿", "保存草稿", "暂存"):
+        for b in page.query_selector_all("button, .d-button, [role=button]"):
+            try:
+                if b.is_visible() and kw in (b.inner_text() or "").strip():
+                    b.click()
+                    page.wait_for_timeout(1000)
+                    _confirm_draft_dialog(page)
+                    _wait_draft_saved(page)
+                    return
+            except Exception:
+                pass
+    _kind, btn = _wait_publish_clickable(page, 15)
+    box = btn.bounding_box()
+    if not box:
+        _die("未定位到发布横条，无法存草稿（可加 --headed 观察）")
+    if os.environ.get("EASEL_PUBLISH_DEBUG"):
+        try:
+            out = PROJECT_ROOT / "outputs" / "_login" / "xhs-draft-bar.png"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            btn.screenshot(path=str(out))
+            print(f"  [debug] 发布横条截图：{out}")
+        except Exception:
+            pass
+    if _draft_click_via_shadow(page):
+        page.wait_for_timeout(1000)
+        _confirm_draft_dialog(page)
+        _wait_draft_saved(page)
+        return
+
+    def _draft_done_quick() -> bool:
+        if "/publish/publish" not in page.url:
+            return True
+        try:
+            return not page.query_selector(SELECTORS["title_input"])
+        except Exception:
+            return False
+
+    # 2026-09-29 实测截图：横条内左侧白色按钮「暂存离开」约在 39% 处（发布在 60-62%），
+    # 闭合 Shadow DOM 拿不到内部元素，按 host 几何坐标多点试。附近点依次兑底。
+    print("  [draft] 按实测坐标点击「暂存离开」（～39%，不中则 35%/43% 兑底）")
+    for frac in (0.39, 0.35, 0.43):
+        if _draft_done_quick():
+            print("✅ 草稿已保存（页面已跳转/表单复位）")
+            return
+        page.mouse.click(box["x"] + box["width"] * frac, box["y"] + box["height"] / 2)
+        page.wait_for_timeout(1500)
+        _confirm_draft_dialog(page)
+        try:
+            _wait_draft_saved(page, timeout_s=10)
+            return
+        except SystemExit:
+            print(f"  [draft] {frac:.0%} 处未生效，换下一坐标")
+    _die("草稿未确认保存：多个坐标均未生效。" + _diag_after_publish(page))
+
+
+def _fill_and_submit(page, title, content, tags, draft: bool = False):
+    """标题→正文→话题→长度校验→发布（draft=True 时改为「暂存」进草稿箱）→成功校验。"""
     content = _normalize_content(content)         # 修连续空行导致的发布失败
     title_el = page.query_selector(SELECTORS["title_input"])
     if not title_el:
@@ -525,6 +667,10 @@ def _fill_and_submit(page, title, content, tags):
     _input_tags(page, content_el, tags)
 
     _check_overflow(page)
+
+    if draft:
+        _click_draft_and_confirm(page)
+        return
 
     kind, btn = _wait_publish_clickable(page, 15)
     btn.scroll_into_view_if_needed()
@@ -547,9 +693,49 @@ def _fill_and_submit(page, title, content, tags):
 # --------------------------------------------------------------------------- #
 # 命令
 # --------------------------------------------------------------------------- #
+def _ensure_xvfb_display() -> bool:
+    """无显示环境时起 Xvfb 虚拟屏并改走有头模式。
+
+    小红书对 headless 指纹直接弹 300012「IP存在风险」风控页(与登录态无关);
+    有头浏览器(UA 无 Headless 标记)可过。无 Xvfb 时维持原 headless 行为。
+    """
+    import os
+    import shutil
+    import subprocess
+    if os.environ.get("DISPLAY"):
+        return True
+    if not shutil.which("Xvfb"):
+        return False
+    # 残留的死 socket 会让后续误判 Xvfb 存活,先探活再清
+    probe = subprocess.run(["pgrep", "-x", "Xvfb"], capture_output=True)
+    if probe.returncode != 0:
+        try:
+            os.unlink("/tmp/.X11-unix/X99")
+        except OSError:
+            pass
+    if not os.path.exists("/tmp/.X11-unix/X99"):
+        subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x900x24"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        for _ in range(40):
+            if os.path.exists("/tmp/.X11-unix/X99"):
+                break
+            time.sleep(0.25)
+    if os.path.exists("/tmp/.X11-unix/X99"):
+        os.environ["DISPLAY"] = ":99"
+        # 真正探活:连不上就当没起
+        r = subprocess.run(["timeout", "2", "xdpyinfo", "-display", ":99"],
+                           capture_output=True)
+        if r.returncode == 0:
+            return True
+    return False
+
+
 def _launch(p, headed: bool, base: str | None, proxy: str | None):
     profile = _profile_dir(base)
     profile.mkdir(parents=True, exist_ok=True)
+    if not headed and _ensure_xvfb_display():
+        headed = True
     args = list(LAUNCH_ARGS)
     kwargs = dict(headless=not headed,
                   locale="zh-CN",
@@ -559,6 +745,10 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None):
     else:
         # 显式直连：Chromium 级屏蔽系统/环境代理（开 VPN 也能用）——同抖音链兜底
         args.append("--no-proxy-server")
+    if headed:
+        # Xvfb 场景:DISPLAY 是 _launch 阶段才设的,node driver 起得比它早,
+        # 必须用 env 参数显式传给浏览器进程
+        kwargs["env"] = dict(os.environ)
     cloak = _cloak_executable()
     if cloak:
         kwargs["executable_path"] = str(cloak)
@@ -814,7 +1004,9 @@ def _publish(a, kind: str) -> int:
                                label="小红书发布内容")
 
     if not a.exec:
-        print("dry-run（加 --exec 真正发布）：\n")
+        mode = "草稿箱模式（加 --exec 真正存入草稿箱；不加 --draft 则为正式发布）" if a.draft \
+            else "dry-run（加 --exec 真正发布）"
+        print(mode + "：\n")
         for ln in _plan_lines(kind, a.title, a.content or "", media, tags):
             print(ln)
         return 0
@@ -854,7 +1046,7 @@ def _publish(a, kind: str) -> int:
                     _click_publish_tab(page, "上传视频")
                     page.wait_for_timeout(1000)
                     _upload_video(page, media[0])
-                _fill_and_submit(page, a.title, a.content or "", tags)
+                _fill_and_submit(page, a.title, a.content or "", tags, draft=bool(a.draft))
             except PWTimeout as e:
                 _die(f"步骤超时（选择器可能已失效，检查 SELECTORS）：{e}")
             finally:
@@ -862,14 +1054,15 @@ def _publish(a, kind: str) -> int:
                     ctx.close()
     finally:
         lock.release()
-    # 发布成功 → 落统一内容日历（对话页自动记录；发布页由 web 设 AUTORECORD=0 跳过防重复）
-    try:
-        import calendar_ops
-        calendar_ops.record_publish("xiaohongshu", a.title,
-                                    ptype="视频" if kind == "video" else "图文",
-                                    tags=(a.tags or ""), note=(a.content or ""), source="chat")
-    except Exception:
-        pass
+    # 发布成功 → 落统一内容日历（--draft 存草稿不算发布，不记；对话页自动记录，发布页由 web 设 AUTORECORD=0 跳过防重复）
+    if not a.draft:
+        try:
+            import calendar_ops
+            calendar_ops.record_publish("xiaohongshu", a.title,
+                                        ptype="视频" if kind == "video" else "图文",
+                                        tags=(a.tags or ""), note=(a.content or ""), source="chat")
+        except Exception:
+            pass
     return 0
 
 
@@ -1022,6 +1215,8 @@ def main() -> int:
         p.add_argument("--exec", action="store_true", help="真正发布（默认 dry-run）")
         p.add_argument("--allow-unsafe", action="store_true",
                        help="放行内容安全闸门（检出内部设置泄露也照发，谨慎）")
+        p.add_argument("--draft", action="store_true",
+                       help="存入草稿箱而非直接发布（点「暂存离开」，成功判定走草稿校验）。注意：平台把草稿存在当前浏览器本地，App/其他设备看不到，仅适合本机浏览器续编后直接发布")
         p.add_argument("--headed", action="store_true", help="有头模式（首次校验选择器用）")
         p.add_argument("--keep-open", action="store_true", help="发布后不关浏览器")
 

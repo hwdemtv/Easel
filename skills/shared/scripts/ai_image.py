@@ -527,8 +527,11 @@ def _post_edits_multipart(base_url: str, api_key: str, model: str,
         with _open(request, 180) as response:
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
+        code = exc.code
         detail = exc.read().decode("utf-8", errors="replace")
-        fail(f"图生图接口返回 HTTP {exc.code}：{detail}")
+        # Agnes 等服务商不提供 /images/edits：图生图走 generations + extra_body.image
+        print(f"[sync] /images/edits 返回 HTTP {code}，回退 generations+extra_body.image ...", file=sys.stderr)
+        return _post_generations_img2img(base_url, api_key, model, prompt, args)
     except urllib.error.URLError as exc:
         fail(f"无法连接图生图接口：{exc.reason}")
     except (http.client.RemoteDisconnected, TimeoutError):
@@ -541,6 +544,22 @@ def _post_edits_multipart(base_url: str, api_key: str, model: str,
     if not isinstance(parsed, dict):
         fail("图生图接口返回格式不正确：顶层不是对象。")
     return parsed
+
+
+def _post_generations_img2img(base_url: str, api_key: str, model: str,
+                              prompt: str, args: argparse.Namespace) -> dict[str, Any]:
+    """Agnes 风格图生图：POST /images/generations + extra_body.image(Data URI)。
+
+    Agnes 文档要求 response_format 放 extra_body 内、勿放顶层，这里照做。
+    """
+    path, _mime = _check_image(args.image)
+    data_uri = encode_image_data_uri(str(path))
+    payload: dict[str, Any] = {"model": model, "prompt": prompt,
+                               "n": args.n, "size": args.size}
+    payload["extra_body"] = {"image": [data_uri], "response_format": "url"}
+    endpoint = _api_url(base_url, "images/generations")
+    print(f"[sync] 提交图生图请求到 {endpoint}（generations+extra_body.image）...", file=sys.stderr)
+    return http_post(endpoint, api_key, payload, timeout=300)
 
 
 def _encode_multipart(fields: dict[str, str],

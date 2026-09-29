@@ -2284,7 +2284,8 @@ async def api_chat_stream(req: ChatRequest):
         run_info: dict = {"stop_reason": None, "last_ev": None, "saw_message_end": False,
                           "run_id": None,
                           "fetch_count": 0, "token_chars": 0, "thinking_chars": 0,
-                          "delegated": False, "ignored_foreign_events": 0}
+                          "delegated": False, "ignored_foreign_events": 0,
+                          "start_ms": int(time.time() * 1000)}
 
         def _drain_stdout():
             try:
@@ -2403,6 +2404,11 @@ async def api_chat_stream(req: ChatRequest):
                 run_info["last_ev"] = ev
             if ev == "assistant_message_end":
                 run_info["saw_message_end"] = True
+                raw_final = (o.get("rawText") or "").strip()
+                if raw_final and raw_final != "NO_REPLY":
+                    # GLM 等思考型模型的多 text 块交错到达，delta 顺序≠最终拼装顺序；
+                    # message_end 自带网关按块序拼好的干净全文，收尾时以此纠偏。
+                    run_info.setdefault("final_texts", []).append(raw_final)
             if not delta:
                 return
             if ev == "assistant_text_stream" and et == "text_delta":
@@ -2501,6 +2507,8 @@ async def api_chat_stream(req: ChatRequest):
                     to_client("activity", item["text"])
                 elif item["t"] == "question":
                     to_client("question", item["text"])
+                elif item["t"] == "final_text":
+                    to_client("final_text", item["text"])
             rc = proc.poll()
             # 等 stdout 读完（stopReason 行在进程收尾时才打印，避免 _tail 先发 SENTINEL 时漏读）
             if stdout_fut is not None:
@@ -2592,8 +2600,36 @@ async def api_chat_stream(req: ChatRequest):
                     }, ensure_ascii=False) + "\n")
             except Exception:
                 pass
+            # GLM 思考型模型 delta 乱序纠偏：message_end 自带干净全文，优先用它。
+            # HTTP 直连路径下 SSE 先于 raw tail 结束，这里等 tail 追平再取（上限 5s）。
+            for _ in range(50):
+                if run_info.get("final_texts") and run_info.get("last_ev") == "assistant_message_end":
+                    break
+                time.sleep(0.1)
+            if not run_info.get("final_texts"):
+                # HTTP 直连模式下伪进程 poll() 立即返回 → tail 线程早早退出，
+                # message_end 事件没人消费。直接扫 raw 文件兜底(按 runId 闩锁，
+                # 未闩锁则按本轮开始时间过滤)，排除 NO_REPLY 内部 run。
+                try:
+                    with open(SHARED_RAW_STREAM, "r", encoding="utf-8", errors="replace") as rf:
+                        for ln in rf:
+                            e = _raw_event_for_run(ln, run_info.get("run_id"))
+                            if not e or e.get("event") != "assistant_message_end":
+                                continue
+                            if run_info.get("run_id") is None:
+                                ts = e.get("ts") or 0
+                                if ts < run_info.get("start_ms", 0) - 1500:
+                                    continue
+                            rt = (e.get("rawText") or "").strip()
+                            if rt and rt != "NO_REPLY":
+                                run_info.setdefault("final_texts", []).append(rt)
+                except OSError:
+                    pass
+            clean_text = "\n\n".join(run_info.get("final_texts") or [])
+            if clean_text:
+                to_client("final_text", clean_text)
             # 落盘完整结果：后端跑完整轮不依赖客户端连接，断线后前端用 /api/chat/last 取回
-            _save_turn(pk, "done", "".join(full_text), {
+            _save_turn(pk, "done", clean_text or "".join(full_text), {
                 "turn_id": turn_id,
                 "clean_end": run_info.get("last_ev") == "assistant_message_end",
                 "stop_reason": "user_stopped" if user_stopped else run_info.get("stop_reason"),
@@ -2654,6 +2690,8 @@ async def api_chat_stream(req: ChatRequest):
                 yield {"id": str(item["id"]), "event": "activity", "data": json.dumps(item["text"], ensure_ascii=False)}
             elif t == "question":
                 yield {"id": str(item["id"]), "event": "question", "data": item["text"]}
+            elif t == "final_text":
+                yield {"id": str(item["id"]), "event": "final_text", "data": json.dumps(item["text"], ensure_ascii=False)}
             elif t == "error":
                 yield {"id": str(item["id"]), "event": "error", "data": json.dumps(item["text"], ensure_ascii=False)}
             elif t == "done":

@@ -149,10 +149,24 @@ TOOLS: list[Tool] = [
 GROUP_NAMES = {"rm": "视频产线套件（Remotion）", "pub": "发布链", "common": "常用库"}
 
 # ═══════════════════════════════════════════════════════════════════════
-# 解释器解析：优先「Scripts 目录已在 PATH 上」的（装完 CLI 直接可见）
+# 解释器解析：优先项目自带 .venv（系统 Python 多为 PEP 668 只读，pip 装不进）；
+# 无 venv 时再选「Scripts 目录已在 PATH 上」的（装完 CLI 直接可见）
 # ═══════════════════════════════════════════════════════════════════════
 
 _PY_LIST: list[str] | None = None
+
+
+def _project_venv_pythons() -> list[str]:
+    """项目根 .venv 里的解释器（存在且 >=3.11 才认）。
+    独立安装版没有 .venv 时自然回落到全局搜索，行为不变。"""
+    root = Path(__file__).resolve().parents[3]   # <root>/skills/shared/scripts/本文件
+    rels = ("Scripts/python.exe",) if os.name == "nt" else ("bin/python", "bin/python3")
+    out: list[str] = []
+    for rel in rels:
+        p = root / ".venv" / rel
+        if p.is_file() and tuple(_python_version(str(p))) >= (3, 11):
+            out.append(str(p))
+    return out
 
 
 def _candidate_pythons() -> list[str]:
@@ -206,6 +220,10 @@ def resolve_python() -> str:
     """选目标解释器；结果缓存。可选 --python 覆盖（见 main）。"""
     global _PY_LIST
     if _PY_LIST:
+        return _PY_LIST[0]
+    venv = _project_venv_pythons()
+    if venv:
+        _PY_LIST = venv
         return _PY_LIST[0]
     path_env = os.environ.get("PATH", "").lower()
     scored = []
@@ -306,10 +324,28 @@ def _run(argv: list[str], *, cwd: str | None = None, timeout: int = 600):
                           encoding="utf-8", errors="replace")
 
 
+# 内置蓝本目录：面板/技能不传 --dir 时的默认工程目录（Easel 项目内自带）
+_BUILTIN_REMOTION_DIR = (
+    Path(__file__).resolve().parents[3]
+    / "skills" / "openclaw" / "video-production" / "vendor"
+    / "video-pipeline-sdk" / "deps" / "remotion"
+)
+
+
+def _default_dir(tool: Tool) -> str | None:
+    """needs_dir 工具未传 --dir 时的内置默认：Remotion 蓝本目录。
+    目录不存在（如独立安装版）时返回 None，维持原有 no_dir 行为。"""
+    if tool.id in ("rmdeps", "shell") and (_BUILTIN_REMOTION_DIR / "package.json").is_file():
+        return str(_BUILTIN_REMOTION_DIR)
+    return None
+
+
 def check_tool(tool: Tool, python: str, dir_: str | None = None) -> dict:
     """单个体检 → {"id","state","version","detail"}；state: ok | missing | no_dir"""
     if tool.needs_dir and not dir_:
-        return {"id": tool.id, "state": "no_dir", "version": None, "detail": "需要 --dir（工程目录）"}
+        dir_ = _default_dir(tool)
+        if not dir_:
+            return {"id": tool.id, "state": "no_dir", "version": None, "detail": "需要 --dir（工程目录）"}
     try:
         if tool.check[0].startswith("@pyfn:"):
             name = tool.check[0].split(":", 1)[1]
@@ -406,7 +442,9 @@ def _ensure_user_path(d: str) -> str:
 def install_tool(tool: Tool, python: str, dir_: str | None = None) -> dict:
     """一键装：策略链依次尝试 → 装完重跑 check，认到才算成。"""
     if tool.needs_dir and not dir_:
-        _die(f"{tool.id} 需要 --dir <工程目录>（{tool.desc}）", 3)
+        dir_ = _default_dir(tool)
+        if not dir_:
+            _die(f"{tool.id} 需要 --dir <工程目录>（{tool.desc}）", 3)
     if tool.needs_dir and not (Path(dir_) / "package.json").is_file():
         _die(f"{dir_} 里没有 package.json，不是 Remotion 工程目录", 3)
 
